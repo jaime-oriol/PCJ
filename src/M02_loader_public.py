@@ -2,8 +2,9 @@
 M02_loader_public - API de lectura de los parquets publicos (Wyscout + StatsBomb).
 
 polars nativo, sin socceraction. I/O puro + normalizacion de tipos + helpers
-por competicion. Sustituye funcionalmente a `src/Z00_loaders_legacy.py` (que
-queda solo si algun training externo exige la API socceraction).
+por competicion. Para convertir events a SPADL (si B01 lo requiere), usar
+`socceraction.spadl.wyscout.convert_to_actions` sobre el DataFrame devuelto
+por `scan_wyscout_events` tras pasarlo a pandas.
 
 Wyscout 2017/18 — corpus base de training (Big 5 + WC18 + Euro16):
     7 parquets de events (uno por competicion), 1.941 matches, 3.25M eventos,

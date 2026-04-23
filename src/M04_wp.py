@@ -568,7 +568,10 @@ def _derive_alphas(params: dict) -> tuple[np.ndarray, np.ndarray]:
 
 
 def predict_wp(feat_vector: dict, minute: int, fit_result: dict) -> tuple[float, float, float]:
-    """Predice (p_home_win, p_draw, p_away_win) dada feature vector + minuto (1..90)."""
+    """Predice (p_home_win, p_draw, p_away_win) dada feature vector + minuto (1..90).
+
+    Aplica temperature scaling si fit_result["temperature"] esta presente.
+    """
     params = fit_result["params"]
     fs = fit_result["feat_stats"]
     fc = fit_result["feat_cols"]
@@ -583,16 +586,15 @@ def predict_wp(feat_vector: dict, minute: int, fit_result: dict) -> tuple[float,
     pD = 1.0 / (1.0 + np.exp(-(alphaD_t[t] - linpred)))
     pA = 1.0 - pD
     pDraw = pD - pH
-    probs = np.array([pH, pDraw, pA]).clip(1e-6, 1 - 1e-6)
-    probs /= probs.sum()
-    return float(probs[0]), float(probs[1]), float(probs[2])
+    probs = np.array([[pH, pDraw, pA]]).clip(1e-6, 1 - 1e-6)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    T = fit_result.get("temperature")
+    probs = _apply_temperature(probs, T) if T is not None else probs
+    return float(probs[0, 0]), float(probs[0, 1]), float(probs[0, 2])
 
 
 def predict_wp_batch(X_df: pl.DataFrame, fit_result: dict) -> np.ndarray:
-    """Predicciones vectorizadas. X_df debe tener feat_cols + 'minute_bin'.
-
-    Devuelve array (N, 3) con [P_H, P_D, P_A] por fila.
-    """
+    """Predicciones vectorizadas (N, 3) con T aplicada si existe en fit_result."""
     params = fit_result["params"]
     fs = fit_result["feat_stats"]
     fc = fit_result["feat_cols"]
@@ -610,20 +612,21 @@ def predict_wp_batch(X_df: pl.DataFrame, fit_result: dict) -> np.ndarray:
     pDraw = pD - pH
     probs = np.stack([pH, pDraw, pA], axis=1).clip(1e-6, 1 - 1e-6)
     probs = probs / probs.sum(axis=1, keepdims=True)
-    return probs
+    T = fit_result.get("temperature")
+    return _apply_temperature(probs, T) if T is not None else probs
 
 
 def save_fit(fit_result: dict, path: Path | None = None) -> Path:
-    """Serializa fit a disco (pickle) para no re-entrenar."""
+    """Serializa fit + T a disco (pickle)."""
     import pickle
     if path is None:
         path = _MODEL / "wp_regulation.pkl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Convertir jax arrays a numpy para portabilidad
     serial = {
         "params": {k: np.array(v) for k, v in fit_result["params"].items()},
         "feat_stats": fit_result["feat_stats"],
         "feat_cols": fit_result["feat_cols"],
+        "temperature": fit_result.get("temperature"),
     }
     with open(path, "wb") as f:
         pickle.dump(serial, f)
@@ -631,7 +634,7 @@ def save_fit(fit_result: dict, path: Path | None = None) -> Path:
 
 
 def load_fit(path: Path | None = None) -> dict:
-    """Deserializa fit guardado."""
+    """Deserializa fit guardado (incluye T si se calibro)."""
     import pickle
     if path is None:
         path = _MODEL / "wp_regulation.pkl"
@@ -659,7 +662,7 @@ def brier_3class(probs: np.ndarray, y: np.ndarray) -> float:
 
 
 def evaluate_brier_per_minute(X_val: pl.DataFrame, fit_result: dict) -> pl.DataFrame:
-    """Brier por bin de minuto sobre val set."""
+    """Brier por bin de minuto sobre val set (incluye T si fit_result lo trae)."""
     probs = predict_wp_batch(X_val, fit_result)
     y = X_val["y"].to_numpy().astype(np.int32)
     out = X_val.select("minute_bin").with_columns([
@@ -668,7 +671,6 @@ def evaluate_brier_per_minute(X_val: pl.DataFrame, fit_result: dict) -> pl.DataF
         pl.Series("p_A", probs[:, 2]),
         pl.Series("y", y),
     ])
-    # Brier por fila
     out = out.with_columns(
         ((pl.col("p_H") - (pl.col("y") == 0).cast(pl.Float64)) ** 2
          + (pl.col("p_D") - (pl.col("y") == 1).cast(pl.Float64)) ** 2
@@ -679,6 +681,74 @@ def evaluate_brier_per_minute(X_val: pl.DataFrame, fit_result: dict) -> pl.DataF
         pl.col("p_H").mean().alias("mean_pH"),
         pl.len().alias("n"),
     ]).sort("minute_bin")
+
+
+# -- Temperature scaling ----------------------------------------------------
+
+def build_wc22_groups_calib_matrix() -> pl.DataFrame:
+    """Matrix de calibracion: 48 partidos fase grupos WC22 x 90 bins.
+
+    Los 48 partidos de grupos NO son sagrados (solo los 16 KO lo son para
+    el test final del PCJ). Los usamos para recalibrar T via temperature
+    scaling. match_id de KO en PFF son los 10502-10517 (16 consecutivos);
+    el resto son fase de grupos.
+    """
+    all_mids = list_event_match_ids()
+    group_mids = [m for m in all_mids if m < 10500]
+    rows = []
+    for mid in group_mids:
+        md = pff_meta(mid).row(0, named=True)
+        home_id = md["home_team_id"]
+        g = pff_goals_timeline(mid)   # excluye disallowed + shootout
+        gh = g.filter(pl.col("scoring_team_id") == home_id)["minute"].to_list()
+        ga = g.filter(pl.col("scoring_team_id") != home_id)["minute"].to_list()
+        sh_90 = sum(1 for x in gh if x < REG_MINUTES)
+        sa_90 = sum(1 for x in ga if x < REG_MINUTES)
+        y = 0 if sh_90 > sa_90 else (2 if sh_90 < sa_90 else 1)
+        for m in range(1, REG_MINUTES + 1):
+            sd = sum(1 for x in gh if x < m) - sum(1 for x in ga if x < m)
+            rows.append({
+                "match_id": mid, "minute_bin": m,
+                "score_diff": sd, "red_diff": 0,
+                "elo_diff": 0.0, "comp_tier": 3, "y": y,
+            })
+    return pl.DataFrame(rows)
+
+
+def _apply_temperature(probs: np.ndarray, T: float) -> np.ndarray:
+    """Aplica temperature scaling a una matriz (N, 3) de probabilidades."""
+    if T is None or abs(T - 1.0) < 1e-6:
+        return probs
+    log_p = np.log(probs.clip(1e-10))
+    scaled = log_p / T
+    scaled -= scaled.max(axis=1, keepdims=True)
+    exp = np.exp(scaled)
+    return exp / exp.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(fit_result: dict, X_calib: pl.DataFrame) -> float:
+    """Optimiza T minimizando NLL sobre X_calib via scipy.
+
+    Busca T en [0.3, 5.0]. Devuelve T optimo.
+    """
+    from scipy.optimize import minimize_scalar
+    probs = predict_wp_batch(X_calib, fit_result)
+    y = X_calib["y"].to_numpy().astype(np.int32)
+
+    def nll(T):
+        p_cal = _apply_temperature(probs, float(T))
+        return -float(np.mean(np.log(p_cal[np.arange(len(y)), y].clip(1e-10))))
+
+    res = minimize_scalar(nll, bounds=(0.3, 5.0), method="bounded",
+                          options={"xatol": 1e-4})
+    return float(res.x)
+
+
+def mean_brier(X: pl.DataFrame, fit_result: dict) -> float:
+    """Brier medio 3-class sobre el DataFrame dado."""
+    probs = predict_wp_batch(X, fit_result)
+    y = X["y"].to_numpy().astype(np.int32)
+    return brier_3class(probs, y)
 
 
 # ===========================================================================
@@ -829,6 +899,11 @@ def compute_wp_per_minute(match_id: int, fit_result: dict,
     gh = goals.filter(pl.col("scoring_side") == "H")["minute"].to_list()
     ga = goals.filter(pl.col("scoring_side") == "A")["minute"].to_list()
 
+    # Proxy fiable de si el partido fue a ET: home_team_start_left_et no-null
+    # (solo se rellena en partidos que realmente jugaron prorroga).
+    md = pff_meta(match_id).row(0, named=True)
+    went_to_et = md["home_team_start_left_et"] is not None
+
     rows = []
     # --- Regulacion 1..90 ---
     for m in range(1, REG_MINUTES + 1):
@@ -836,7 +911,6 @@ def compute_wp_per_minute(match_id: int, fit_result: dict,
         fv = {"score_diff": sd, "red_diff": 0, "elo_diff": elo_diff,
               "comp_tier": comp_tier}
         pH, pD, pA = predict_wp(fv, m, fit_result)
-        # Leverage = diff WP si home marca +1: usamos fv con sd+1
         fv_plus = {**fv, "score_diff": sd + 1}
         pH_plus, _, _ = predict_wp(fv_plus, m, fit_result)
         leverage = abs(pH_plus - pH)
@@ -846,12 +920,8 @@ def compute_wp_per_minute(match_id: int, fit_result: dict,
             "leverage": leverage, "score_diff": sd, "phase": "regulation",
         })
 
-    # --- ET 91..120 (solo si partido llega a ET) ---
-    # Usa score_diff final de regulacion + Poisson
-    sd_final_reg = sum(1 for x in gh if x < REG_MINUTES + 1) \
-                  - sum(1 for x in ga if x < REG_MINUTES + 1)
-    et_max_event = max([m for m in gh + ga if m > REG_MINUTES], default=0)
-    if et_max_event > 0 or sd_final_reg == 0:
+    # --- ET 91..120 (solo si el partido realmente jugo prorroga) ---
+    if went_to_et:
         for m in range(REG_MINUTES + 1, REG_MINUTES + ET_MINUTES + 1):
             sd = sum(1 for x in gh if x < m) - sum(1 for x in ga if x < m)
             minute_et = m - REG_MINUTES
@@ -903,12 +973,14 @@ if __name__ == "__main__":
     t0 = time.time()
     X, info = build_training_matrix(cache=True)
     print(f"training matrix: {info} en {time.time()-t0:.1f}s")
-    print(f"  dtypes score_diff={X.schema['score_diff']}, red_diff={X.schema['red_diff']}")
+    print(f"  dtypes: score_diff={X.schema['score_diff']} "
+          f"red_diff={X.schema['red_diff']} elo_diff={X.schema['elo_diff']}")
     print(f"  y distrib: {X.group_by('y').len().sort('y').to_dicts()}")
     print(f"  score_diff range: [{X['score_diff'].min()}, {X['score_diff'].max()}]")
     print(f"  red_diff   range: [{X['red_diff'].min()}, {X['red_diff'].max()}]")
+    print(f"  elo_diff   range: [{X['elo_diff'].min():.0f}, {X['elo_diff'].max():.0f}]")
 
-    # 2. Split y fit
+    # 2. Split train/val + fit
     X_tr, X_val = train_val_split(X, val_frac=0.2, seed=42)
     print(f"\ntrain={X_tr.height:,} val={X_val.height:,}")
 
@@ -921,19 +993,30 @@ if __name__ == "__main__":
         fit = fit_wp(X_tr, n_steps=3000)
         print(f"SVI fit en {time.time()-t0:.1f}s")
         save_fit(fit)
-        print(f"fit guardado en {fit_path}")
 
-    # 3. Brier por bin
+    # 3. Brier pre-calibration
+    brier_pre = mean_brier(X_val, fit)
+    print(f"\nBrier pre-calib sobre val: {brier_pre:.4f}")
+
+    # 4. Temperature scaling sobre 48 partidos grupos WC22
+    t0 = time.time()
+    X_calib = build_wc22_groups_calib_matrix()
+    T_opt = fit_temperature(fit, X_calib)
+    fit["temperature"] = T_opt
+    save_fit(fit)  # Persiste T
+    print(f"calib matrix: {X_calib.height} samples ({X_calib['match_id'].n_unique()} partidos) "
+          f"en {time.time()-t0:.1f}s")
+    print(f"T optimo: {T_opt:.4f}")
+
+    # 5. Brier post-calibration
+    brier_post = mean_brier(X_val, fit)
+    print(f"Brier post-calib sobre val: {brier_post:.4f} (delta {brier_post-brier_pre:+.4f})")
     brier_df = evaluate_brier_per_minute(X_val, fit)
-    avg_brier = float(brier_df["brier"].mean())
-    print(f"\nBrier 3-class sobre val: mean={avg_brier:.4f}")
-    print("brier por 10-min bins:")
     tenbin = brier_df.with_columns((pl.col("minute_bin") // 10 * 10).alias("bin10"))
-    print(tenbin.group_by("bin10").agg([
-        pl.col("brier").mean(), pl.col("n").sum()
-    ]).sort("bin10"))
+    print("brier post-calib por 10-min bins:")
+    print(tenbin.group_by("bin10").agg([pl.col("brier").mean(), pl.col("n").sum()]).sort("bin10"))
 
-    # 4. Predict sanity check
+    # 6. Predict sanity checks (post-calib)
     print()
     for (sd, minute, elo, tier, label) in [
         (0,  1,   0.0, 1, "0-0 min1 liga"),
@@ -945,21 +1028,21 @@ if __name__ == "__main__":
                         "comp_tier": tier}, minute, fit)
         print(f"  {label:<25} H={p[0]:.3f} D={p[1]:.3f} A={p[2]:.3f}")
 
-    # 5. compute_wp_per_minute sobre 1 partido PFF (ET test)
-    from M01_loader_pff import list_matches
-    inv = list_matches()
-    mid_et = 10511  # NED-ARG, fue a ET
-    print(f"\ncompute_wp_per_minute({mid_et}) [NED-ARG con ET]:")
+    # 7. compute_wp_per_minute ET sanity (NED-ARG 10511)
+    mid_et = 10511
+    print(f"\ncompute_wp_per_minute({mid_et}) [NED-ARG con ET + penaltis]:")
     wp = compute_wp_per_minute(mid_et, fit)
-    print(f"  filas: {wp.height}, phases: {wp['phase'].unique().to_list()}")
-    key_minutes = wp.filter(pl.col("minute").is_in([1, 45, 89, 105, 120]))
-    print(key_minutes.select(["minute","phase","score_diff","wp_home","wp_draw","wp_away"]))
+    print(f"  filas: {wp.height}, phases: {sorted(wp['phase'].unique().to_list())}")
+    key_minutes = wp.filter(pl.col("minute").is_in([1, 45, 83, 90, 105, 120]))
+    print(key_minutes.select(["minute","phase","score_diff","wp_home","wp_draw","wp_away","leverage"]))
 
-    # 6. Cache all 64 PFF
+    # 8. Cache all 64 PFF
     print()
     t0 = time.time()
     out = cache_all_wp(fit, overwrite=True)
     print(f"cache_all_wp -> {out} en {time.time()-t0:.1f}s")
     big = pl.read_parquet(out)
-    print(f"  total filas: {big.height:,} (esperado 64 * ~100 = ~6400)")
-    print(f"  matches cacheados: {big['match_id'].n_unique()}")
+    print(f"  total filas: {big.height:,}  matches cacheados: {big['match_id'].n_unique()}/64")
+    # Sanity: todos los 64 con filas, al menos 90 bins cada uno
+    per_match = big.group_by("match_id").len().sort("len")
+    print(f"  bins por partido min/max: [{per_match['len'].min()}, {per_match['len'].max()}]")

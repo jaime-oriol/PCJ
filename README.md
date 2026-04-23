@@ -14,8 +14,8 @@ src/
 ├── M01_loader_pff.py       # API PFF (events, tracking, metadata, rosters + vistas)
 ├── M02_loader_public.py    # API Wyscout + StatsBomb (polars nativo)
 ├── M03_preprocess.py       # direction, score state, minutos, enrich_events
-├── (M04-M16)               # pipeline restante (ver docs/ARCHITECTURE.md)
-├── Z00_loaders_legacy.py   # wrappers socceraction legacy
+├── M04_wp.py               # Win Probability bayesiana (numpyro) + leverage + ET + pen
+├── (M05-M16)               # pipeline restante (ver docs/ARCHITECTURE.md)
 ├── Z01_vaep.py             # B01 atomic-VAEP (building block)
 └── Z02_pitch_control.py    # B02 PPCF (building block)
 ```
