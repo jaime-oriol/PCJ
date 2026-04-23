@@ -1,6 +1,6 @@
-# PCJ — Perfil Clutch del Jugador
+# PCJ: Perfil Clutch del Jugador
 
-TFM Master Big Data Aplicado al Scouting Deportivo (Sevilla FC / Sport Data Campus).
+TFM Master Big Data Aplicado al Scouting Deportivo (Sport Data Campus).
 
 Estimacion causal del efecto del shock emocional (gol a favor / gol en contra) sobre el comportamiento del jugador en ventanas pre vs post de ±10 min, medido en cuatro canales (Empuje Ofensivo, Solidez Defensiva, Inteligencia Espacial Off-ball, Pulso Fisico) sobre PFF FC World Cup Qatar 2022.
 
