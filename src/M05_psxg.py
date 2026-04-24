@@ -97,7 +97,7 @@ def _point_in_cone(p: tuple[float, float],
 def _freeze_frame_features(freeze_frame: list | None,
                            shot_loc: tuple[float, float],
                            end_loc: tuple[float, float]) -> dict:
-    """Extrae features del 360 freeze-frame.
+    """Extrae features del 360 freeze-frame con geometria rica.
 
     Devuelve keys con 'ff_' prefix para separacion clara.
     Si freeze_frame es None o vacio, valores neutros (medianas tipicas).
@@ -108,13 +108,19 @@ def _freeze_frame_features(freeze_frame: list | None,
     out = {
         "ff_has_frame":         0,
         "ff_keeper_present":    0,
-        "ff_keeper_x":          float(_SB_GOAL_X),    # asumir en la linea
+        "ff_keeper_x":          float(_SB_GOAL_X),
         "ff_keeper_y":          float(_SB_GOAL_Y),
+        "ff_keeper_off_line":   0.0,
+        "ff_keeper_y_offset":   0.0,
+        "ff_keeper_dist_shot":  20.0,
         "ff_n_def_in_cone":     1,
         "ff_n_def_near_end":    0,
         "ff_dist_nearest_def":  5.0,
         "ff_dist_nearest_teammate":  10.0,
         "ff_n_teammates_near_end": 0,
+        "ff_n_def_total":       5,
+        "ff_n_teammates_total": 3,
+        "ff_def_between_shot_goal": 0,
     }
     if not freeze_frame:
         return out
@@ -138,10 +144,16 @@ def _freeze_frame_features(freeze_frame: list | None,
         else:
             def_locs.append(p)
 
+    out["ff_n_def_total"] = len(def_locs)
+    out["ff_n_teammates_total"] = len(teammate_locs)
+
     if keeper_loc is not None:
         out["ff_keeper_present"] = 1
         out["ff_keeper_x"] = keeper_loc[0]
         out["ff_keeper_y"] = keeper_loc[1]
+        out["ff_keeper_off_line"] = _SB_GOAL_X - keeper_loc[0]   # cuanto salio
+        out["ff_keeper_y_offset"] = abs(keeper_loc[1] - _SB_GOAL_Y)
+        out["ff_keeper_dist_shot"] = _dist(keeper_loc, shot_loc)
 
     # Defenders en cono shot -> goal
     in_cone = 0
@@ -149,6 +161,11 @@ def _freeze_frame_features(freeze_frame: list | None,
         if _point_in_cone(dp, shot_loc, post_near, post_far):
             in_cone += 1
     out["ff_n_def_in_cone"] = in_cone
+
+    # Defensores ESTRICTAMENTE entre shot y gol (x > shot_x)
+    out["ff_def_between_shot_goal"] = sum(
+        1 for dp in def_locs if dp[0] > shot_loc[0]
+    )
 
     # Defenders y teammates cerca del endpoint
     if def_locs:
@@ -185,18 +202,37 @@ def _shot_to_features(ev_dict: dict) -> dict | None:
     sh_type = (shot.get("type")     or {}).get("name") or "Open Play"
     play_p  = (ev_dict.get("play_pattern") or {}).get("name") or "Regular Play"
 
+    # Geometria pre-shot
+    dist_goal = _dist((x, y), (_SB_GOAL_X, _SB_GOAL_Y))
+    angle_goal = _angle_to_goal(x, y)
+    post_near = (_SB_GOAL_X, _SB_GOAL_Y - _SB_GOAL_HALF)
+    post_far  = (_SB_GOAL_X, _SB_GOAL_Y + _SB_GOAL_HALF)
+    # Apertura visual del arco desde la posicion del shot (ley del coseno)
+    d_near = _dist((x, y), post_near)
+    d_far  = _dist((x, y), post_far)
+    # cos rule: cos(aperture) = (d_near^2 + d_far^2 - goal_width^2) / (2 d_near d_far)
+    goal_w = 2 * _SB_GOAL_HALF
+    cos_aperture = (d_near**2 + d_far**2 - goal_w**2) / (2 * d_near * d_far + 1e-8)
+    cos_aperture = max(-1.0, min(1.0, cos_aperture))
+    goal_aperture = float(np.arccos(cos_aperture))   # angulo solido al arco
+
     feats = {
         "x":                x,
         "y":                y,
-        "dist_goal":        _dist((x, y), (_SB_GOAL_X, _SB_GOAL_Y)),
-        "angle_goal":       _angle_to_goal(x, y),
-        # end_x NO se incluye: SB end_location es post-shot REAL (en el keeper
-        # si fue save, dentro del arco si fue gol) -> leakage trivial del outcome.
-        # end_y y end_z son trayectoria LATERAL y ALTURA del balon, que son
-        # features legitimas del "quality of shot" (puntería).
+        "dist_goal":        dist_goal,
+        "angle_goal":       angle_goal,
+        "goal_aperture":    goal_aperture,           # mas grande = mas facil
+        "dist_goal_x_aperture": dist_goal * goal_aperture,  # interaccion
+        # Posicion relativa al arco
+        "y_from_center":    abs(y - _SB_GOAL_Y),
+        "x_to_goal_line":   _SB_GOAL_X - x,
+        # Trayectoria legitima (no cruce de linea)
         "end_y":            end_y,
         "end_z":            end_z,
         "end_y_from_center": abs(end_y - _SB_GOAL_Y),
+        "end_z_above_bar":  max(0.0, end_z - 2.44),  # saliente sobre el travesano
+        "end_near_post":    min(abs(end_y - 36), abs(end_y - 44)),   # dist al palo
+        "end_lane":         abs(end_y - 40) / 4.0,   # lane normalizada [0=center, >1=out]
         # body part one-hot (4 clases)
         "bp_right_foot":    int(body == "Right Foot"),
         "bp_left_foot":     int(body == "Left Foot"),
@@ -307,10 +343,13 @@ def build_wc22_shots(cache: bool = True) -> pl.DataFrame:
 # ===========================================================================
 
 FEATURE_COLS = [
-    # Pre-shot
+    # Pre-shot geometria
     "x", "y", "dist_goal", "angle_goal",
-    # Shot trajectory (legitima, NO cruce de linea)
+    "goal_aperture", "dist_goal_x_aperture",
+    "y_from_center", "x_to_goal_line",
+    # Shot trajectory legitima (NO cruce de linea)
     "end_y", "end_z", "end_y_from_center",
+    "end_z_above_bar", "end_near_post", "end_lane",
     # Body / technique / type (one-hot)
     "bp_right_foot", "bp_left_foot", "bp_head", "bp_other",
     "tech_normal", "tech_volley", "tech_half_volley", "tech_lob",
@@ -323,9 +362,11 @@ FEATURE_COLS = [
     # 360 freeze-frame (posicion AT SHOT TIME, no post-shot)
     "ff_has_frame", "ff_keeper_present",
     "ff_keeper_x", "ff_keeper_y",
-    "ff_n_def_in_cone", "ff_n_def_near_end",
+    "ff_keeper_off_line", "ff_keeper_y_offset", "ff_keeper_dist_shot",
+    "ff_n_def_in_cone", "ff_def_between_shot_goal",
+    "ff_n_def_near_end", "ff_n_def_total",
     "ff_dist_nearest_def", "ff_dist_nearest_teammate",
-    "ff_n_teammates_near_end",
+    "ff_n_teammates_near_end", "ff_n_teammates_total",
 ]
 # Features EXCLUIDAS por leakage outcome (documentado):
 #   end_x             : >120 si cruza linea = goal, <120 si parada/bloqueo
@@ -334,14 +375,89 @@ FEATURE_COLS = [
 #                       (si save, keeper = end_location → cero; si gol, lejano)
 
 
-def fit_psxg(df: pl.DataFrame, n_folds: int = 5,
-             seed: int = 42) -> dict:
-    """Entrena PSxG via LightGBM + 5-fold CV stratified por match + isotonic.
+def _get_folds(match_ids: np.ndarray, n_folds: int, seed: int) -> list[np.ndarray]:
+    """Split por match (cada partido entero en un solo fold)."""
+    unique_matches = np.array(sorted(set(match_ids)))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_matches)
+    return [np.array(f) for f in np.array_split(unique_matches, n_folds)]
 
-    Returns:
-        dict con 'model' (LightGBM final entrenado todo), 'calibrator'
-        (IsotonicRegression), 'oof_pred' (OOF pred calibrada), 'oof_raw'
-        (sin calibrar), 'feature_cols', 'metrics'.
+
+def _cv_oof(X: np.ndarray, y: np.ndarray, match_ids: np.ndarray,
+            folds: list[np.ndarray], params: dict, seed: int) -> np.ndarray:
+    """OOF predictions con params dados. Retorna pred OOF (raw, sin calibrar)."""
+    import lightgbm as lgb
+    oof = np.zeros(len(y), dtype=np.float32)
+    for fi, val_m in enumerate(folds):
+        val_mask = np.isin(match_ids, val_m)
+        tr_mask = ~val_mask
+        model = lgb.LGBMClassifier(**params, random_state=seed + fi, verbose=-1)
+        model.fit(X[tr_mask], y[tr_mask],
+                  eval_set=[(X[val_mask], y[val_mask])],
+                  callbacks=[lgb.early_stopping(30, verbose=False)])
+        oof[val_mask] = model.predict_proba(X[val_mask])[:, 1]
+    return oof
+
+
+def tune_hyperparameters(df: pl.DataFrame, n_trials: int = 60,
+                         n_folds: int = 5, seed: int = 42,
+                         timeout_sec: int | None = None) -> dict:
+    """Optuna hyperparam search maximizando AUC CV (5-fold by match).
+
+    Returns: dict con best_params + estudio summary.
+    """
+    import optuna
+    from sklearn.metrics import roc_auc_score
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    X = df.select(FEATURE_COLS).to_numpy().astype(np.float32)
+    y = df["_label"].to_numpy().astype(np.int32)
+    match_ids = df["_match_id"].to_numpy()
+    folds = _get_folds(match_ids, n_folds, seed)
+
+    def objective(trial):
+        params = {
+            "n_estimators":      trial.suggest_int("n_estimators", 150, 900),
+            "max_depth":         trial.suggest_int("max_depth", 3, 9),
+            "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "num_leaves":        trial.suggest_int("num_leaves", 7, 127),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 60),
+            "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
+            "subsample_freq":    1,
+            "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha":         trial.suggest_float("reg_alpha", 1e-4, 2.0, log=True),
+            "reg_lambda":        trial.suggest_float("reg_lambda", 1e-4, 2.0, log=True),
+            "min_split_gain":    trial.suggest_float("min_split_gain", 0.0, 0.2),
+        }
+        oof = _cv_oof(X, y, match_ids, folds, params, seed)
+        return float(roc_auc_score(y, oof))
+
+    study = optuna.create_study(direction="maximize",
+                                 sampler=optuna.samplers.TPESampler(seed=seed))
+    study.optimize(objective, n_trials=n_trials, timeout=timeout_sec, show_progress_bar=False)
+    return {
+        "best_params": study.best_params,
+        "best_auc":    study.best_value,
+        "n_trials":    len(study.trials),
+    }
+
+
+def fit_psxg(df: pl.DataFrame, n_folds: int = 5, seed: int = 42,
+             tuned_params: dict | None = None,
+             n_trials: int = 60) -> dict:
+    """Entrena PSxG via LightGBM con Optuna tuning + isotonic calibration.
+
+    Pipeline riguroso:
+      1. Optuna hyperparameter search (60 trials por defecto) maximizando AUC CV.
+      2. 5-fold CV stratified by match con best_params -> OOF predictions.
+      3. Isotonic calibration sobre OOF -> predictions calibradas.
+      4. Modelo FINAL entrenado sobre TODO el training con best_params.
+      5. Metrics CV: AUC raw/calibrated, Brier, LogLoss, ECE (Expected Calibration Error)
+         vs SB statsbomb_xg baseline.
+
+    Args:
+        tuned_params: si se pasan, evita Optuna (para re-train con params ya conocidos).
+        n_trials: Optuna trials si tuned_params es None.
     """
     import lightgbm as lgb
     from sklearn.isotonic import IsotonicRegression
@@ -351,56 +467,56 @@ def fit_psxg(df: pl.DataFrame, n_folds: int = 5,
     y = df["_label"].to_numpy().astype(np.int32)
     match_ids = df["_match_id"].to_numpy()
     sb_xg = df["_sb_xg"].to_numpy()
+    folds = _get_folds(match_ids, n_folds, seed)
 
-    # Split por match (CV folds donde cada match va entero a un fold)
-    unique_matches = np.array(sorted(set(match_ids)))
-    rng = np.random.default_rng(seed)
-    rng.shuffle(unique_matches)
-    folds = np.array_split(unique_matches, n_folds)
+    # 1. Hyperparameter tuning
+    if tuned_params is None:
+        print(f"Optuna tuning (n_trials={n_trials}, 5-fold CV by match)...")
+        tune_res = tune_hyperparameters(df, n_trials=n_trials, n_folds=n_folds, seed=seed)
+        best_params = tune_res["best_params"]
+        print(f"  best AUC tuning: {tune_res['best_auc']:.4f}")
+        print(f"  best params: {best_params}")
+    else:
+        best_params = tuned_params
 
-    oof_raw = np.zeros(len(y), dtype=np.float32)
-    for fi, val_matches in enumerate(folds):
-        val_mask = np.isin(match_ids, val_matches)
-        tr_mask = ~val_mask
-        model = lgb.LGBMClassifier(
-            n_estimators=400, max_depth=5, learning_rate=0.03,
-            num_leaves=15, min_child_samples=20,
-            subsample=0.9, colsample_bytree=0.9,
-            reg_alpha=0.0, reg_lambda=0.1,
-            random_state=seed + fi, verbose=-1,
-        )
-        model.fit(X[tr_mask], y[tr_mask],
-                  eval_set=[(X[val_mask], y[val_mask])],
-                  callbacks=[lgb.early_stopping(30, verbose=False)])
-        oof_raw[val_mask] = model.predict_proba(X[val_mask])[:, 1]
+    # 2. OOF con best params
+    oof_raw = _cv_oof(X, y, match_ids, folds, best_params, seed)
 
-    # Isotonic calibration sobre OOF
+    # 3. Isotonic calibration
     calibrator = IsotonicRegression(out_of_bounds="clip")
     calibrator.fit(oof_raw, y)
     oof_cal = calibrator.predict(oof_raw)
 
-    # Metricas
+    # 4. Metrics + ECE
+    def ece(p: np.ndarray, y_: np.ndarray, n_bins: int = 10) -> float:
+        bins = np.linspace(0, 1, n_bins + 1)
+        n = len(p)
+        s = 0.0
+        for i in range(n_bins):
+            mask = (p >= bins[i]) & (p < bins[i+1] if i < n_bins-1 else p <= bins[i+1])
+            if mask.sum() == 0:
+                continue
+            s += (mask.sum() / n) * abs(p[mask].mean() - y_[mask].mean())
+        return float(s)
+
     metrics = {
-        "auc_psxg_raw":       float(roc_auc_score(y, oof_raw)),
+        "auc_psxg_raw":        float(roc_auc_score(y, oof_raw)),
         "auc_psxg_calibrated": float(roc_auc_score(y, oof_cal)),
-        "auc_baseline_sb_xg": float(roc_auc_score(y, sb_xg)),
-        "brier_psxg":         float(brier_score_loss(y, oof_cal)),
-        "brier_sb_xg":        float(brier_score_loss(y, sb_xg)),
-        "logloss_psxg":       float(log_loss(y, np.clip(oof_cal, 1e-6, 1-1e-6))),
-        "logloss_sb_xg":      float(log_loss(y, np.clip(sb_xg, 1e-6, 1-1e-6))),
-        "n_shots":            len(y),
-        "n_goals":            int(y.sum()),
-        "goal_rate":          float(y.mean()),
+        "auc_baseline_sb_xg":  float(roc_auc_score(y, sb_xg)),
+        "brier_psxg":          float(brier_score_loss(y, oof_cal)),
+        "brier_sb_xg":         float(brier_score_loss(y, sb_xg)),
+        "logloss_psxg":        float(log_loss(y, np.clip(oof_cal, 1e-6, 1-1e-6))),
+        "logloss_sb_xg":       float(log_loss(y, np.clip(sb_xg, 1e-6, 1-1e-6))),
+        "ece_psxg":            ece(oof_cal, y),
+        "ece_sb_xg":           ece(sb_xg, y),
+        "n_shots":             len(y),
+        "n_goals":             int(y.sum()),
+        "goal_rate":           float(y.mean()),
+        "best_params":         best_params,
     }
 
-    # Modelo FINAL sobre todo el training (para aplicar a WC22)
-    final_model = lgb.LGBMClassifier(
-        n_estimators=400, max_depth=5, learning_rate=0.03,
-        num_leaves=15, min_child_samples=20,
-        subsample=0.9, colsample_bytree=0.9,
-        reg_alpha=0.0, reg_lambda=0.1,
-        random_state=seed, verbose=-1,
-    )
+    # 5. Modelo final sobre todo el training
+    final_model = lgb.LGBMClassifier(**best_params, random_state=seed, verbose=-1)
     final_model.fit(X, y)
 
     return {
@@ -411,6 +527,35 @@ def fit_psxg(df: pl.DataFrame, n_folds: int = 5,
         "oof_cal":       oof_cal,
         "metrics":       metrics,
     }
+
+
+def permutation_importance_cv(fit: dict, df: pl.DataFrame, n_repeats: int = 5,
+                               seed: int = 42) -> pl.DataFrame:
+    """Permutation importance sobre OOF: feature que al shufflearse baja AUC.
+
+    Util para detectar leakage (feature dominante que no debe ser determinante).
+    """
+    from sklearn.metrics import roc_auc_score
+    X = df.select(fit["feature_cols"]).to_numpy().astype(np.float32)
+    y = df["_label"].to_numpy()
+
+    # Pred base del modelo final sobre todo (proxy; si overfits algo es normal)
+    baseline_pred = fit["model"].predict_proba(X)[:, 1]
+    baseline_auc = roc_auc_score(y, baseline_pred)
+
+    rng = np.random.default_rng(seed)
+    results = []
+    for i, col in enumerate(fit["feature_cols"]):
+        drops = []
+        for _ in range(n_repeats):
+            X_perm = X.copy()
+            idx = rng.permutation(len(X_perm))
+            X_perm[:, i] = X_perm[idx, i]
+            perm_pred = fit["model"].predict_proba(X_perm)[:, 1]
+            drops.append(baseline_auc - roc_auc_score(y, perm_pred))
+        results.append({"feature": col, "auc_drop_mean": float(np.mean(drops)),
+                        "auc_drop_std": float(np.std(drops))})
+    return pl.DataFrame(results).sort("auc_drop_mean", descending=True)
 
 
 def save_fit(fit: dict, path: Path | None = None) -> Path:
@@ -558,3 +703,11 @@ if __name__ == "__main__":
     print(f"  saves totales: {n_saves}")
     print(f"  saves PSxG >= 0.6 (estricto): {n_nearmiss_06}")
     print(f"  saves PSxG >= 0.4 (laxo)    : {n_nearmiss_04}")
+
+    # Permutation importance — detectar leakage residual
+    print(f"\nPermutation importance (n_repeats=3) — TOP 10:")
+    imp = permutation_importance_cv(fit, train, n_repeats=3, seed=42)
+    print(imp.head(10))
+    dom = imp.filter(pl.col("auc_drop_mean") > 0.15)
+    assert dom.height <= 1, f"Posible leakage: {dom.height} features dominantes"
+    print(f"  Features con AUC drop > 0.15: {dom.height} (esperado <=1)")
