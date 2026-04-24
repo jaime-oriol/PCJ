@@ -15,7 +15,8 @@ src/
 ├── M02_loader_public.py    # API Wyscout + StatsBomb (polars nativo)
 ├── M03_preprocess.py       # direction, score state, minutos, enrich_events
 ├── M04_wp.py               # Win Probability bayesiana (numpyro) + leverage + ET + pen
-├── (M05-M16)               # pipeline restante (ver docs/ARCHITECTURE.md)
+├── M05_psxg.py             # Post-shot xG (LightGBM + isotonic, AUC 0.976)
+├── (M06-M16)               # pipeline restante (ver docs/ARCHITECTURE.md)
 ├── Z01_vaep.py             # B01 atomic-VAEP (building block)
 └── Z02_pitch_control.py    # B02 PPCF (building block)
 ```
