@@ -82,7 +82,11 @@ def build_xg_grid(nx: int = _GRID_NX, ny: int = _GRID_NY,
     """P(goal | shot desde celda) sobre media-campo atacante (60-120 x 0-80 SB).
 
     Fuente: SB shots training (Euro20+Euro24+Bundes23, sin WC22).
-    Fallback: si celda tiene 0 shots, se asigna 0.03 (xG baseline remoto).
+    Post-processing:
+      1. Symmetrizar en Y (el campo es simetrico y=0 <-> y=80).
+      2. Smoothing 3x3 uniform (reduce varianza por cells con pocos shots).
+      3. Fallback 0.03 para cells sin data.
+    Fix asimetria LW/RW detectada al samplear solo 3545 shots -> 50 shots/cell.
     """
     cache_path = _DERIVED / "xg_grid.npy"
     if cache and cache_path.exists():
@@ -103,6 +107,19 @@ def build_xg_grid(nx: int = _GRID_NX, ny: int = _GRID_NY,
     mask = cnt > 0
     xg[mask] /= cnt[mask]
     xg[~mask] = 0.03
+
+    # Symmetrizar en Y (asumimos simetria del campo)
+    xg = (xg + xg[:, ::-1]) / 2.0
+
+    # Smoothing 3x3 uniform kernel (ignora bordes)
+    smoothed = np.copy(xg)
+    for i in range(nx):
+        for j in range(ny):
+            i0, i1 = max(0, i-1), min(nx, i+2)
+            j0, j1 = max(0, j-1), min(ny, j+2)
+            smoothed[i, j] = xg[i0:i1, j0:j1].mean()
+    xg = smoothed
+
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(cache_path, xg)
     return xg
