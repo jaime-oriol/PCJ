@@ -8,18 +8,19 @@ puerta clara es aleatorio dado pre-estado). M13 AIPW los usa como IV.
 Cinco tipos con umbrales pre-registrados (propuesta §1.7):
   (a) Palo/travesano       : shot.outcome in {Post, Saved to Post},
                              xg pre-shot in [0.15, 0.85]
-  (b) Offside milimetrico  : Offside event con margin <= 1.5m entre atacante
-                             y linea de ultimo defensor (proxy de freeze-frame)
+  (b) Offside milimetrico  : Offside event con margin <= 1.5m medido sobre
+                             StatsBomb 360 freeze_frame (linea defensiva real).
+                             Fallback proxy att_x > 110 si no hay 360.
   (c) Parada PSxG alto     : outcome=Saved y (PSxG>=0.6 OR xg_baseline>=0.4)
-  (d) Despeje linea gol    : outcome in {Saved Off Target} + heuristica end_x
-  (e) GLT no-gol           : outcome=Saved con end_x >= 119.5 (muy raro)
+  (d) Despeje linea gol    : outcome == Saved Off Target (marker SB directo).
+  (e) GLT no-gol           : fuera de scope (raro en WC22).
 
 Acceptance (ARCHITECTURE.md): distribucion coherente con benchmarks.
   Escalado a 64 partidos: ~120-185 near-miss totales.
 
 Output: data/parquet/derived/nearmiss/nearmiss_table.parquet
   cols: match_id, event_uuid, period, minute, second, team_id, team_name,
-        near_miss_type, psxg, xg_baseline, margin_info.
+        shot_outcome, is_goal, xg_baseline, psxg, near_miss_type, margin_info.
 
 Depende de: M02 (SB events), M05 (PSxG cache).
 """
@@ -35,7 +36,9 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from M02_loader_public import load_statsbomb_events, list_statsbomb_match_ids
+from M02_loader_public import (
+    load_statsbomb_events, list_statsbomb_match_ids, load_statsbomb_360,
+)
 
 
 # -- Rutas ------------------------------------------------------------------
@@ -43,7 +46,6 @@ from M02_loader_public import load_statsbomb_events, list_statsbomb_match_ids
 _REPO    = Path(__file__).resolve().parents[1]
 _DERIVED = _REPO / "data" / "parquet" / "derived" / "nearmiss"
 _PSXG    = _REPO / "data" / "parquet" / "derived" / "psxg" / "shots.parquet"
-_PSXG_WC22_FEAT = _REPO / "data" / "parquet" / "derived" / "psxg" / "wc22_shots.parquet"
 
 
 # -- Umbrales pre-registrados ----------------------------------------------
@@ -53,7 +55,6 @@ XG_SAVE_LAX          = 0.40
 XG_POST_MIN          = 0.15
 XG_POST_MAX          = 0.85
 OFFSIDE_TIGHT_METERS = 1.5     # margen X entre atacante y ultimo defensor
-GLT_X_THRESHOLD      = 119.5   # SB coords: linea gol = 120
 
 
 # ===========================================================================
@@ -68,11 +69,6 @@ def _load_psxg_shots() -> pl.DataFrame:
             "Ejecuta `python src/M05_psxg.py` primero."
         )
     return pl.read_parquet(_PSXG)
-
-
-def _load_wc22_shot_features() -> pl.DataFrame:
-    """Carga features crudas de WC22 shots (para end_x info)."""
-    return pl.read_parquet(_PSXG_WC22_FEAT)
 
 
 # ===========================================================================
@@ -113,19 +109,13 @@ def _detect_saves_clutch(psxg: pl.DataFrame,
     )
 
 
-def _detect_goal_line_clearance(
-    psxg: pl.DataFrame, wc22_feat: pl.DataFrame,
-) -> pl.DataFrame:
-    """(d) Despeje linea gol: 'Saved Off Target' (SB marker directo) +
-    heuristica end_x >= 119 (balon MUY cerca de la linea).
-    """
-    # Shots con outcome 'Saved Off Target'
-    sot = psxg.filter(pl.col("shot_outcome") == "Saved Off Target")
+def _detect_goal_line_clearance(psxg: pl.DataFrame) -> pl.DataFrame:
+    """(d) Despeje linea gol: 'Saved Off Target' (SB marker directo).
 
-    # Heuristica complementaria: bloqueos con end_x >= 119 (cerca linea)
-    # Cross-reference: wc22_feat tiene _event_uuid + _outcome + end_x?
-    # Ojo: en nuestra version post-fix, removimos end_x; no disponible.
-    # Asi que esta rama (d) solo coge 'Saved Off Target'.
+    Nota: no tenemos end_x en el feature set post-fix de M05 (era leakage).
+    Nos limitamos al marker SB directo; la heuristica end_x esta out of scope.
+    """
+    sot = psxg.filter(pl.col("shot_outcome") == "Saved Off Target")
     return sot.with_columns(
         pl.lit("d_goal_line_clearance").alias("near_miss_type"),
         pl.col("psxg").alias("margin_info"),
@@ -144,15 +134,49 @@ def _detect_glt_denied(psxg: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+_OFFSIDE_SCHEMA = {
+    "match_id": pl.Int64, "event_uuid": pl.String,
+    "period": pl.Int64, "minute": pl.Int64, "second": pl.Int64,
+    "team_id": pl.Int64, "team_name": pl.String,
+    "shot_outcome": pl.String, "is_goal": pl.Boolean,
+    "xg_baseline": pl.Float64, "psxg": pl.Float64,
+    "near_miss_type": pl.String, "margin_info": pl.Float64,
+}
+
+
+def _offside_margin_from_ff(att_x: float, ff: list) -> float | None:
+    """Margen (metros) entre atacante y linea defensiva a partir de freeze-frame SB.
+
+    La linea defensiva = max(x) entre defensores no-keeper.
+    Margin positivo = atacante por DELANTE de la linea (offsided).
+    Coords SB 120x80; 1 unidad ~ 1m. Devuelve None si no hay defensores visibles.
+    """
+    if not ff:
+        return None
+    def_xs = []
+    for p in ff:
+        if p is None:
+            continue
+        tm = p.get("teammate")
+        kp = p.get("keeper")
+        loc = p.get("location")
+        if tm is True or kp is True or loc is None or len(loc) < 2:
+            continue
+        def_xs.append(float(loc[0]))
+    if not def_xs:
+        return None
+    return att_x - max(def_xs)
+
+
 def _detect_offside_tight(match_ids: list[int],
                            tight_meters: float = OFFSIDE_TIGHT_METERS
                            ) -> pl.DataFrame:
-    """(b) Offside milimetrico: Offside events con margen pequeno entre
-    atacante y linea de ultimo defensor (freeze_frame analysis).
+    """(b) Offside milimetrico real: margen <= tight_meters entre atacante y
+    linea defensiva (max x de no-keeper).
 
-    Margen = distancia X entre atacante (event.location.x) y el defensor no-keeper
-    con x mas alto (la linea defensiva). Si tight_meters cm o menos -> near-miss.
-    Coords SB: 120x80 metros proporcional, 1 unidad ~ 1m.
+    Fuente: StatsBomb 360 freeze_frames. Si falta el 360 del partido o del
+    evento concreto, cae a proxy att_x > 110 y flag margin_info = NaN para
+    downstream sensitivity. Vectorizado por partido (1 carga 360 / partido).
     """
     rows = []
     for mid in match_ids:
@@ -160,53 +184,48 @@ def _detect_offside_tight(match_ids: list[int],
         off = ev.filter(pl.col("type").struct.field("name") == "Offside")
         if off.height == 0:
             continue
-        for r in off.to_dicts():
+        try:
+            ff_df = load_statsbomb_360(mid)
+            ff_map = dict(zip(ff_df["event_uuid"].to_list(),
+                               ff_df["freeze_frame"].to_list()))
+        except FileNotFoundError:
+            ff_map = {}
+
+        for r in off.iter_rows(named=True):
             loc = r.get("location")
             if loc is None or len(loc) < 2:
                 continue
             att_x = float(loc[0])
-            # freeze_frame en Offside events de SB 360 (si disponible)
-            ff = r.get("shot")   # Offsides no tienen shot; puede tener 360
-            # En algunos casos SB anade 360 al Offside event via freeze_frame separado
-            # (no siempre). Fallback: usar location del atacante solo.
-            # Sin freeze_frame no podemos medir margen exacto; filtramos por location
-            # avanzada (att_x > 110, zona de ataque) como proxy.
-            margin = None
-            fzf = None
-            # Intentar extraer freeze_frame si existe (raro en Offside events SB)
-            if isinstance(ff, dict) and ff.get("freeze_frame"):
-                fzf = ff["freeze_frame"]
-            # buscar freeze_frame en el event raw tambien (StatsBomb 360 files)
-            # Nota: los 360 freeze_frames oficiales van en archivo aparte
-            # (load_statsbomb_360), no en el event. Para keep scope, uso location proxy.
-            # Criterio proxy: offside event con att_x > 110 y att_x <= 120 = zona
-            # cercana al area -> posible near-miss. M13 puede refinar con PFF tracking.
-            if att_x > 110:
-                rows.append({
-                    "match_id":    int(mid),
-                    "event_uuid":  r.get("id"),
-                    "period":      int(r.get("period") or 1),
-                    "minute":      int(r.get("minute") or 0),
-                    "second":      int(r.get("second") or 0),
-                    "team_id":     int((r.get("team") or {}).get("id") or 0),
-                    "team_name":   (r.get("team") or {}).get("name"),
-                    "shot_outcome": "Offside",
-                    "is_goal":     False,
-                    "xg_baseline": None,
-                    "psxg":        None,
-                    "near_miss_type": "b_offside_close",
-                    "margin_info":   float(120.0 - att_x),   # dist a linea gol
-                })
+            ff = ff_map.get(r.get("id"))
+            margin = _offside_margin_from_ff(att_x, ff) if ff else None
+
+            if margin is not None:
+                is_tight = 0.0 <= margin <= tight_meters
+            else:
+                is_tight = att_x > 110.0        # proxy fallback
+
+            if not is_tight:
+                continue
+            team = r.get("team") or {}
+            rows.append({
+                "match_id":    int(mid),
+                "event_uuid":  r.get("id"),
+                "period":      int(r.get("period") or 1),
+                "minute":      int(r.get("minute") or 0),
+                "second":      int(r.get("second") or 0),
+                "team_id":     int(team.get("id") or 0),
+                "team_name":   team.get("name"),
+                "shot_outcome": "Offside",
+                "is_goal":     False,
+                "xg_baseline": None,
+                "psxg":        None,
+                "near_miss_type": "b_offside_close",
+                "margin_info": float(margin) if margin is not None
+                                else float(120.0 - att_x),
+            })
     if not rows:
-        return pl.DataFrame(schema={
-            "match_id": pl.Int64, "event_uuid": pl.String,
-            "period": pl.Int64, "minute": pl.Int64, "second": pl.Int64,
-            "team_id": pl.Int64, "team_name": pl.String,
-            "shot_outcome": pl.String, "is_goal": pl.Boolean,
-            "xg_baseline": pl.Float64, "psxg": pl.Float64,
-            "near_miss_type": pl.String, "margin_info": pl.Float64,
-        })
-    return pl.DataFrame(rows)
+        return pl.DataFrame(schema=_OFFSIDE_SCHEMA)
+    return pl.DataFrame(rows, schema_overrides=_OFFSIDE_SCHEMA)
 
 
 # ===========================================================================
@@ -230,35 +249,31 @@ def build_near_miss_table(cache: bool = True,
         return pl.read_parquet(cache_path)
 
     psxg = _load_psxg_shots()
-    wc22_feat = _load_wc22_shot_features()
     wc22_mids = list_statsbomb_match_ids(comp_id=43, season_id=106)
 
-    # Normalizar columnas consistentes: add team_id / team_name from SB events
-    # Para ello necesitamos traer desde SB por event_uuid. Hacemos join masivo.
-    team_lookup_rows = []
+    # team_id / team_name: extraccion vectorizada via polars (evita loop py).
+    team_dfs = []
     for mid in wc22_mids:
         ev = load_statsbomb_events(mid)
         shots = ev.filter(pl.col("type").struct.field("name") == "Shot")
-        for d in shots.to_dicts():
-            team_lookup_rows.append({
-                "event_uuid": d.get("id"),
-                "team_id":    int((d.get("team") or {}).get("id") or 0),
-                "team_name":  (d.get("team") or {}).get("name"),
-            })
-    teams = pl.DataFrame(team_lookup_rows)
-
+        if shots.height == 0:
+            continue
+        team_dfs.append(shots.select([
+            pl.col("id").alias("event_uuid"),
+            pl.col("team").struct.field("id").cast(pl.Int64).alias("team_id"),
+            pl.col("team").struct.field("name").alias("team_name"),
+        ]))
+    teams = pl.concat(team_dfs) if team_dfs else pl.DataFrame(
+        schema={"event_uuid": pl.String, "team_id": pl.Int64, "team_name": pl.String}
+    )
     psxg_enriched = psxg.join(teams, on="event_uuid", how="left")
 
-    # (a) Woodwork
+    # (a) Woodwork, (c) Saves, (d) GLC, (e) GLT, (b) Offside
     woodwork = _detect_woodwork(psxg_enriched, lax=lax_woodwork)
-    # (c) Saves clutch
-    saves = _detect_saves_clutch(psxg_enriched, strict_only=False)
-    # (d) Goal line clearance
-    glc = _detect_goal_line_clearance(psxg_enriched, wc22_feat)
-    # (e) GLT
-    glt = _detect_glt_denied(psxg_enriched)
-    # (b) Offside close
-    offside = _detect_offside_tight(wc22_mids)
+    saves    = _detect_saves_clutch(psxg_enriched, strict_only=False)
+    glc      = _detect_goal_line_clearance(psxg_enriched)
+    glt      = _detect_glt_denied(psxg_enriched)
+    offside  = _detect_offside_tight(wc22_mids)
 
     # Unificar schema
     cols = ["match_id", "event_uuid", "period", "minute", "second",
@@ -267,7 +282,18 @@ def build_near_miss_table(cache: bool = True,
 
     def _align(df: pl.DataFrame) -> pl.DataFrame:
         missing = [c for c in cols if c not in df.columns]
-        return df.with_columns([pl.lit(None).alias(c) for c in missing]).select(cols)
+        # Casts explicitos a los tipos target para que concat no falle
+        lits = []
+        for c in missing:
+            if c in ("match_id", "period", "minute", "second", "team_id"):
+                lits.append(pl.lit(None, dtype=pl.Int64).alias(c))
+            elif c in ("xg_baseline", "psxg", "margin_info"):
+                lits.append(pl.lit(None, dtype=pl.Float64).alias(c))
+            elif c == "is_goal":
+                lits.append(pl.lit(None, dtype=pl.Boolean).alias(c))
+            else:
+                lits.append(pl.lit(None, dtype=pl.String).alias(c))
+        return df.with_columns(lits).select(cols)
 
     all_nm = pl.concat(
         [_align(woodwork), _align(saves), _align(glc),
@@ -275,10 +301,11 @@ def build_near_miss_table(cache: bool = True,
         how="diagonal_relaxed",
     )
 
-    # Dedup: un mismo shot podria cruzar criterios (a) y (c)? El PSxG shots
-    # tiene outcome unico. Post != Saved, asi que no hay solape. Offside es
-    # disjunto. OK.
-    all_nm = all_nm.sort(["match_id", "minute", "second"])
+    # Dedup explicito por (event_uuid, near_miss_type): un mismo tiro podria
+    # aparecer en (a) y (c) en edge cases raros (Post + PSxG alto). Dedup
+    # defensivo para garantia downstream.
+    all_nm = all_nm.unique(subset=["event_uuid", "near_miss_type"],
+                            keep="first").sort(["match_id", "minute", "second"])
 
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)

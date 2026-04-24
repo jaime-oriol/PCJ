@@ -1,40 +1,45 @@
 """
-M09_defensa - Canal Solidez Defensiva via VDEP-style atomic-VAEP.
+M09_defensa - Canal Solidez Defensiva.
 
 Fase 2 PCJ, canal 2 de 4. Valora la contribucion defensiva individual por
-jugador-minuto. Captura tanto pressing alto que recupera (tackles/interceptions)
-como bloque bajo que evita ocasiones (via defensive_value reducing P(concedes)).
+jugador-minuto combinando on-ball (VAEP) con off-ball (tracking PFF 25 Hz).
 
-Approach SOTA pragmatico:
-  - Reutiliza el modelo atomic-VAEP entrenado en M08 (mismo CatBoost 5-fold CV +
-    isotonic calibration) -> `defensive_value` per action.
-  - defensive_value(action) mide cuanto REDUCE P(encajar_en_10_actions) la
-    accion realizada por el defensor. Es el equivalente de VDEP (Toda 2022)
-    adaptado a atomic-VAEP.
-  - Agregado: score_def_minute = sum(defensive_value) por (match_id, player_id,
-    minute) = contribucion defensiva on-ball total del jugador en ese minuto.
-  - Complemento: n_def_actions (tackles + interceptions + clearances + take_on
-    defendido) como feature adicional.
+Reutiliza el modelo atomic-VAEP entrenado en M08 (CatBoost 5-fold CV +
+Optuna + isotonic). defensive_value(action) mide cuanto REDUCE
+P(encajar_en_10_acciones) la accion del defensor (formula atomic-VAEP).
 
-NO se implementa VDEP puro de Toda desde cero: el defensive_value del
-atomic-VAEP entrenado en M08 usa features ricas (tipo de accion, body part,
-location, tiempo, team) y es equivalente en expresividad. Maejima 2024
-individualization se aproxima aqui por el "player_id del actor" del event
-(tackle/interception/clearance) — NO via nearest-defender-at-ball tracking
-(eso requiere PFF tracking 25fps, reservado para M10 Off-ball).
+Cuatro sub-canales agregados per (match, player, minute):
+  1. score_def_minute       : sum(defensive_value) sobre TODAS las acciones on-ball.
+  2. vdep_minute            : sum(defensive_value) FILTRADO a acciones defensivas
+                              (tackle, interception, clearance, foul, keeper_*).
+                              Equivalente a VDEP (Toda 2022 PLOS ONE) sin entrenar
+                              modelo separado - misma cabeza p(concedes)
+                              condicionada a acciones defensivas.
+  3. def_third_pct          : fraccion de frames en el tercio defensivo propio
+                              durante posesion rival (bloque bajo).
+  4. press_intensity_frames : # frames-jugador a <= 3 m del balon durante posesion
+                              rival (aprox. Bekkers 2024 arXiv:2501.04712).
 
 Output:
   data/parquet/derived/defensa/
-    per_minute.parquet           # (match_id, player_id_sb, minute,
-                                 #  score_def_minute, n_def_actions)
-    per_shock_window.parquet     # (match_id, shock_id, player_id_pff,
-                                 #  shock_type, score_def_pre, score_def_post,
-                                 #  n_def_actions_pre, n_def_actions_post)
+    def_third_context.parquet    # (pff_match_id, player_id, minute,
+                                 #  def_third_pct, press_intensity_frames,
+                                 #  oppo_possession_frames)
+    per_minute.parquet           # sb_match_id + pff_match_id + sb/pff_player_id +
+                                 #  minute + score_def_minute + vdep_minute +
+                                 #  n_def_actions + n_actions_total +
+                                 #  def_third_pct + press_intensity_frames +
+                                 #  oppo_possession_frames
+    per_shock_window.parquet     # (match_id, shock_id, pff_player_id, shock_type,
+                                 #  score_def_{pre,post}, vdep_{pre,post},
+                                 #  n_def_actions_{pre,post}, press_frames_{pre,post})
 
 Acceptance (ARCHITECTURE): distribucion score_def por rol coherente
 (CBs y DMs > CFs); GK score_def positivo por saves etc.
 
-Depende de: M08 (modelo VAEP + atomic SPADL WC22 + mapping SB->PFF).
+Depende de: M08 (modelo VAEP + atomic SPADL WC22 + mapping SB->PFF),
+M01 (tracking PFF + rosters), M03 (attacking_direction, SB<->PFF match map),
+M07 (shocks table).
 """
 
 from __future__ import annotations
@@ -42,14 +47,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from M01_loader_pff import load_rosters, load_metadata, scan_tracking
-from M03_preprocess import attacking_direction
+from M01_loader_pff import (
+    load_rosters, load_metadata, scan_tracking, list_event_match_ids,
+)
+from M03_preprocess import attacking_direction, _pff_to_sb_match_id
 from M07_shocks import build_shocks_table
 import M08_ataque as atk
 
@@ -70,128 +78,152 @@ _DEF_ACTION_TYPES = {
     "keeper_pick_up",
 }
 
+# Umbral (metros) para "presionar": defensor a <= radio del balon.
+_PRESS_RADIUS_M    = 3.0
+# Hysteresis de posesion: frames de debounce para home_ball flips espurios
+# (corner, lateral). 2 frames @ 25 Hz = 80 ms, suficiente para descartar
+# transiciones instantaneas sin perder recoveries reales.
+_POSS_HYSTERESIS_F = 2
+
 
 # ===========================================================================
 #  SECCION 0 — Contexto defensivo off-ball via tracking PFF (bloque bajo)
 # ===========================================================================
 
+_DEF_CTX_SCHEMA = {
+    "pff_match_id": pl.Int64, "player_id": pl.Int64, "minute": pl.Int64,
+    "def_third_pct": pl.Float64, "press_intensity_frames": pl.Int64,
+    "oppo_possession_frames": pl.Int64,
+}
+
+
+def _smooth_possession(home_ball: np.ndarray, k: int = _POSS_HYSTERESIS_F) -> np.ndarray:
+    """Debounce hysteresis: require k consecutive frames of same value to flip.
+
+    Implementacion O(n) sin copia: recorre la secuencia y mantiene ultimo valor
+    estable; un flip solo se acepta tras k frames del nuevo valor.
+    """
+    n = len(home_ball)
+    if n == 0 or k <= 1:
+        return home_ball.astype(bool)
+    out = np.empty(n, dtype=bool)
+    last_stable = bool(home_ball[0])
+    run = 0
+    current = last_stable
+    for i in range(n):
+        v = bool(home_ball[i])
+        if v == current:
+            run += 1
+        else:
+            current = v
+            run = 1
+        if run >= k:
+            last_stable = current
+        out[i] = last_stable
+    return out
+
+
 def _def_third_pct_match(match_id: int) -> pl.DataFrame:
-    """% tiempo de cada jugador en TERCIO DEFENSIVO propio durante posesion RIVAL.
+    """Contexto off-ball por jugador-minuto via tracking PFF 25 Hz (vectorizado).
 
-    Captura "bloque bajo": defensa clutch cuando el equipo aguanta el resultado.
-    Distinto a las acciones on-ball (VAEP) — es CONTEXTO POSICIONAL off-ball.
+    Tres metricas derivadas en 1 pasada polars (explode + joins, sin loops py):
+      - def_third_frames        : jugador en tercio defensivo durante posesion rival.
+      - press_intensity_frames  : jugador a <= PRESS_RADIUS_M del balon durante
+                                    posesion rival (aprox. Bekkers 2024).
+      - oppo_possession_frames  : denominador (frames en posesion rival).
 
-    Usa tracking PFF 25fps:
-      - homePlayersSmoothed / awayPlayersSmoothed solo tienen jerseyNum (String).
-      - Se mapea (team_id, shirt_number) -> player_id via rosters PFF.
-      - Para cada frame: equipo EN POSESION via game_event.home_ball.
-      - Si MI equipo NO tiene balon: ¿estoy en mi tercio defensivo?
-      - Tercio defensivo: x (post-flip) < -L/6 en coords centradas en (0,0).
+    Posesion usa home_ball con hysteresis _POSS_HYSTERESIS_F (filtra flips
+    espurios en corner/lateral). Coords PFF (metros, centro 0,0).
     """
     md = load_metadata(match_id).row(0, named=True)
     home_id = md["home_team_id"]
     away_id = md["away_team_id"]
     pitch_length = float(md.get("pitch_length") or 105.0)
     def_third_thr = -pitch_length / 6.0
+    fps = float(md.get("fps") or 25.0)
+    frames_per_min = fps * 60.0
+    press_r2 = _PRESS_RADIUS_M ** 2
 
-    # Mapping (team, jersey_int) -> player_id via rosters
-    ro = load_rosters(match_id).select(["team_id","player_id","shirt_number"])
-    home_map = {int(r["shirt_number"]): int(r["player_id"])
-                for r in ro.filter(pl.col("team_id")==home_id).iter_rows(named=True)
-                if r["shirt_number"] is not None}
-    away_map = {int(r["shirt_number"]): int(r["player_id"])
-                for r in ro.filter(pl.col("team_id")==away_id).iter_rows(named=True)
-                if r["shirt_number"] is not None}
+    # Lookup (team_id, shirt) -> player_id desde rosters
+    ro = load_rosters(match_id).select(["team_id", "player_id", "shirt_number"]) \
+        .filter(pl.col("shirt_number").is_not_null()) \
+        .with_columns(pl.col("shirt_number").cast(pl.Int64, strict=False)
+                        .alias("jersey_int"))
 
-    dirs = attacking_direction(match_id).to_dicts()
-    dir_lookup = {(d["team_id"], d["period"]): d["direction"] for d in dirs}
+    # Lookup (team_id, period) -> direction ('R'|'L') -> sign (+1|-1)
+    dir_df = attacking_direction(match_id).with_columns(
+        pl.when(pl.col("direction") == "R").then(1.0).otherwise(-1.0).alias("def_sign")
+    ).select(["team_id", "period", "def_sign"])
 
-    lf = scan_tracking(match_id)
-    frames = lf.select([
+    frames = scan_tracking(match_id).select([
         pl.col("frameNum"),
         pl.col("period"),
         pl.col("game_event").struct.field("home_ball").alias("home_has_ball"),
         pl.col("homePlayersSmoothed").alias("home_players"),
         pl.col("awayPlayersSmoothed").alias("away_players"),
+        pl.col("ball").list.first().struct.field("x").alias("bx"),
+        pl.col("ball").list.first().struct.field("y").alias("by"),
     ]).filter(pl.col("home_has_ball").is_not_null()).collect()
 
     if frames.height == 0:
-        return pl.DataFrame(schema={
-            "pff_match_id": pl.Int64, "player_id": pl.Int64, "minute": pl.Int64,
-            "def_third_pct": pl.Float64, "oppo_possession_frames": pl.Int64,
-        })
+        return pl.DataFrame(schema=_DEF_CTX_SCHEMA)
 
-    rows = []
-    fps = float(md.get("fps") or 25.0)
-    frames_per_min = fps * 60
+    # Hysteresis sobre home_ball
+    hb = _smooth_possession(frames["home_has_ball"].to_numpy().astype(bool),
+                             _POSS_HYSTERESIS_F)
+    frames = frames.with_columns(pl.Series("home_has_ball_smooth", hb))
 
-    for r in frames.iter_rows(named=True):
-        frame_num = int(r["frameNum"])
-        period = int(r["period"])
-        home_has_ball = bool(r["home_has_ball"])
-        minute = int(frame_num // frames_per_min)
+    # Proceso cada side como DF separado (defendiendo = side no tiene balon)
+    def _side_frame(players_col: str, side_team_id: int, defending_mask: pl.Expr) -> pl.DataFrame:
+        sel = frames.filter(defending_mask).select([
+            "frameNum", "period", "bx", "by",
+            pl.col(players_col).alias("players"),
+        ]).explode("players").filter(pl.col("players").is_not_null()).with_columns([
+            pl.col("players").struct.field("x").alias("x"),
+            pl.col("players").struct.field("y").alias("y"),
+            pl.col("players").struct.field("jerseyNum")
+                              .cast(pl.Int64, strict=False).alias("jersey_int"),
+            pl.lit(side_team_id, dtype=pl.Int64).alias("team_id"),
+        ]).filter(pl.col("x").is_not_null() & pl.col("jersey_int").is_not_null())
+        return sel
 
-        # HOME defendiendo (away tiene balon)
-        if not home_has_ball and r["home_players"]:
-            dir_home = dir_lookup.get((home_id, period), "R")
-            sign = 1.0 if dir_home == "R" else -1.0
-            for p in r["home_players"]:
-                x = p.get("x")
-                jersey = p.get("jerseyNum")
-                if x is None or jersey is None: continue
-                try: jnum = int(jersey)
-                except (ValueError, TypeError): continue
-                pid = home_map.get(jnum)
-                if pid is None: continue
-                rows.append({
-                    "player_id": pid,
-                    "minute":    minute,
-                    "in_def_third": (sign * x) < def_third_thr,
-                })
+    home_def = _side_frame("home_players", home_id, ~pl.col("home_has_ball_smooth"))
+    away_def = _side_frame("away_players", away_id,  pl.col("home_has_ball_smooth"))
+    all_def = pl.concat([home_def, away_def]) if (home_def.height + away_def.height) > 0 \
+              else home_def  # schema vacio consistente
 
-        # AWAY defendiendo (home tiene balon)
-        if home_has_ball and r["away_players"]:
-            dir_away = dir_lookup.get((away_id, period), "L")
-            sign = 1.0 if dir_away == "R" else -1.0
-            for p in r["away_players"]:
-                x = p.get("x")
-                jersey = p.get("jerseyNum")
-                if x is None or jersey is None: continue
-                try: jnum = int(jersey)
-                except (ValueError, TypeError): continue
-                pid = away_map.get(jnum)
-                if pid is None: continue
-                rows.append({
-                    "player_id": pid,
-                    "minute":    minute,
-                    "in_def_third": (sign * x) < def_third_thr,
-                })
+    if all_def.height == 0:
+        return pl.DataFrame(schema=_DEF_CTX_SCHEMA)
 
-    if not rows:
-        return pl.DataFrame(schema={
-            "sb_match_id": pl.Int64, "player_id": pl.Int64, "minute": pl.Int64,
-            "def_third_pct": pl.Float64, "oppo_possession_frames": pl.Int64,
-        })
+    # Joins: jersey -> player_id, direction -> sign
+    all_def = all_def.join(
+        ro.select(["team_id", "jersey_int", "player_id"]),
+        on=["team_id", "jersey_int"], how="inner",
+    ).join(dir_df, on=["team_id", "period"], how="left")
 
-    df = pl.DataFrame(rows)
-    agg = df.group_by(["player_id", "minute"]).agg([
+    # Metricas por frame-jugador
+    agg = all_def.with_columns([
+        (pl.col("frameNum") / frames_per_min).cast(pl.Int64).alias("minute"),
+        ((pl.col("def_sign") * pl.col("x")) < def_third_thr).alias("in_def_third"),
+        (((pl.col("x") - pl.col("bx")) ** 2
+          + (pl.col("y") - pl.col("by")) ** 2) <= press_r2).alias("pressing"),
+    ]).group_by(["player_id", "minute"]).agg([
         pl.col("in_def_third").sum().alias("def_third_frames"),
+        pl.col("pressing").sum().alias("press_intensity_frames"),
         pl.len().alias("oppo_possession_frames"),
-    ]).with_columns(
-        (pl.col("def_third_frames") / pl.col("oppo_possession_frames")).alias("def_third_pct")
-    ).with_columns(
+    ]).with_columns([
+        (pl.col("def_third_frames") / pl.col("oppo_possession_frames"))
+         .alias("def_third_pct"),
         pl.lit(match_id).cast(pl.Int64).alias("pff_match_id"),
-    ).select(["pff_match_id", "player_id", "minute",
-              "def_third_pct", "oppo_possession_frames"])
+    ]).select(list(_DEF_CTX_SCHEMA.keys()))
     return agg
 
 
 def build_def_third_all(cache: bool = True) -> pl.DataFrame:
-    """Agrega def_third_pct para los 64 partidos WC22."""
+    """Agrega def_third_pct + press_intensity_frames para los 64 partidos WC22."""
     cache_path = _DERIVED / "def_third_context.parquet"
     if cache and cache_path.exists():
         return pl.read_parquet(cache_path)
-    from M01_loader_pff import list_event_match_ids
     import time
     dfs = []
     t0 = time.time()
@@ -202,7 +234,7 @@ def build_def_third_all(cache: bool = True) -> pl.DataFrame:
             print(f"  skip {mid}: {e}")
         if (i+1) % 10 == 0:
             print(f"  {i+1}/64 en {time.time()-t0:.1f}s", flush=True)
-    out = pl.concat(dfs) if dfs else pl.DataFrame()
+    out = pl.concat(dfs) if dfs else pl.DataFrame(schema=_DEF_CTX_SCHEMA)
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         out.write_parquet(cache_path, compression="snappy")
@@ -238,15 +270,21 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
         pl.col("type_name").is_in(list(_DEF_ACTION_TYPES)).alias("is_def_action"),
     ]).filter(pl.col("player_id").is_not_null())
 
+    # vdep_contrib = defensive_value solo en acciones defensivas (VDEP puro Toda 2022)
+    df = df.with_columns(
+        pl.when(pl.col("is_def_action")).then(pl.col("defensive_value"))
+          .otherwise(0.0).alias("vdep_contrib")
+    )
+
     agg = df.group_by(["game_id", "player_id", "minute"]).agg([
         pl.col("defensive_value").sum().alias("score_def_minute"),
+        pl.col("vdep_contrib").sum().alias("vdep_minute"),
         pl.col("is_def_action").sum().alias("n_def_actions"),
         pl.len().alias("n_actions_total"),
     ]).rename({"game_id": "sb_match_id", "player_id": "sb_player_id"})
 
     # Join con CONTEXTO off-ball (def_third_pct via tracking PFF).
     # Necesita mapeo sb_player_id -> pff_player_id y sb_match_id -> pff_match_id.
-    from M03_preprocess import _pff_to_sb_match_id
     sb2pff = {v: k for k, v in _pff_to_sb_match_id().items()}
     player_map = atk.build_sb_to_pff_player_map(cache=True).select([
         "sb_player_id", "pff_player_id",
@@ -267,12 +305,14 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
             pl.col("player_id").cast(pl.Int64).alias("pff_player_id"),
             pl.col("minute").cast(pl.Int64),
         ]).select(["pff_match_id", "pff_player_id", "minute",
-                   "def_third_pct", "oppo_possession_frames"])
+                   "def_third_pct", "press_intensity_frames",
+                   "oppo_possession_frames"])
         agg = agg.join(def_ctx_cast,
                         on=["pff_match_id", "pff_player_id", "minute"], how="left")
     else:
         agg = agg.with_columns([
             pl.lit(None, dtype=pl.Float64).alias("def_third_pct"),
+            pl.lit(None, dtype=pl.Int64).alias("press_intensity_frames"),
             pl.lit(None, dtype=pl.Int64).alias("oppo_possession_frames"),
         ])
 
@@ -297,7 +337,6 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
     shocks = build_shocks_table(cache=True, overwrite=False)
 
     # Map sb_match_id -> pff_match_id
-    from M03_preprocess import _pff_to_sb_match_id
     sb2pff = {v: k for k, v in _pff_to_sb_match_id().items()}
 
     per_min = per_min.with_columns([
@@ -327,14 +366,18 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         (pl.col("min_sec") < pl.col("window_pre_end"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("score_def_minute").sum().alias("score_def_pre"),
+        pl.col("vdep_minute").sum().alias("vdep_pre"),
         pl.col("n_def_actions").sum().alias("n_def_actions_pre"),
+        pl.col("press_intensity_frames").sum().alias("press_frames_pre"),
     ])
     post = joined.filter(
         (pl.col("min_sec") >= pl.col("window_post_start")) &
         (pl.col("min_sec") <= pl.col("window_post_end"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("score_def_minute").sum().alias("score_def_post"),
+        pl.col("vdep_minute").sum().alias("vdep_post"),
         pl.col("n_def_actions").sum().alias("n_def_actions_post"),
+        pl.col("press_intensity_frames").sum().alias("press_frames_post"),
     ])
 
     base = shocks.select([
@@ -346,8 +389,12 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
               .with_columns([
                   pl.col("score_def_pre").fill_null(0.0),
                   pl.col("score_def_post").fill_null(0.0),
+                  pl.col("vdep_pre").fill_null(0.0),
+                  pl.col("vdep_post").fill_null(0.0),
                   pl.col("n_def_actions_pre").fill_null(0),
                   pl.col("n_def_actions_post").fill_null(0),
+                  pl.col("press_frames_pre").fill_null(0),
+                  pl.col("press_frames_post").fill_null(0),
               ])
 
     if cache:

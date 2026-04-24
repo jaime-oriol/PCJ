@@ -28,6 +28,7 @@ Depende de M01 (loader PFF). M02 publicos no se tocan aqui.
 from __future__ import annotations
 
 import sys
+import warnings
 from pathlib import Path
 
 import polars as pl
@@ -38,7 +39,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from M01_loader_pff import (
-    load_metadata, load_rosters, load_events, list_goals, list_subs, scan_events,
+    load_metadata, load_rosters, load_events, list_goals, list_subs,
     list_event_match_ids,
 )
 from M02_loader_public import load_statsbomb_matches, load_statsbomb_events
@@ -111,6 +112,34 @@ def _pff_to_sb_match_id() -> dict[int, int]:
     return mapping
 
 
+_GOALS_SCHEMA = {
+    "match_id": pl.Int64, "period": pl.Int64,
+    "start_game_clock": pl.Int64, "minute": pl.Int64,
+    "scoring_team_id": pl.Int64, "is_own_goal": pl.Boolean,
+    "cum_home": pl.Int64, "cum_away": pl.Int64,
+}
+
+
+def _goals_timeline_pff_fallback(match_id: int, home_id: int,
+                                  away_id: int) -> pl.DataFrame:
+    """Fallback PFF raw con filtros disallowed + shootout. No fiable al 100%."""
+    g = list_goals(match_id).filter(~pl.col("disallowed") & ~pl.col("shootout"))
+    if g.height == 0:
+        return pl.DataFrame(schema=_GOALS_SCHEMA)
+    df = g.select([
+        pl.lit(match_id).cast(pl.Int64).alias("match_id"),
+        pl.col("period").cast(pl.Int64),
+        pl.col("start_game_clock").cast(pl.Int64),
+        (pl.col("start_game_clock") // 60).cast(pl.Int64).alias("minute"),
+        pl.col("team_id").cast(pl.Int64).alias("scoring_team_id"),
+        pl.lit(False).alias("is_own_goal"),
+    ]).sort("start_game_clock").with_columns([
+        (pl.col("scoring_team_id") == home_id).cast(pl.Int64).cum_sum().alias("cum_home"),
+        (pl.col("scoring_team_id") == away_id).cast(pl.Int64).cum_sum().alias("cum_away"),
+    ])
+    return df.select(list(_GOALS_SCHEMA.keys()))
+
+
 def goals_timeline(match_id: int) -> pl.DataFrame:
     """Goles validos del partido con cum_home / cum_away.
 
@@ -135,18 +164,21 @@ def goals_timeline(match_id: int) -> pl.DataFrame:
     home_id = md["home_team_id"]
     away_id = md["away_team_id"]
     home_name = md["home_team_name"]
-    away_name = md["away_team_name"]
 
     mapping = _pff_to_sb_match_id()
     sb_mid = mapping.get(match_id)
     if sb_mid is None:
-        # Partido sin SB correspondencia: devolver schema vacio
-        return pl.DataFrame(schema={
-            "match_id": pl.Int64, "period": pl.Int64,
-            "start_game_clock": pl.Int64, "minute": pl.Int64,
-            "scoring_team_id": pl.Int64, "is_own_goal": pl.Boolean,
-            "cum_home": pl.Int64, "cum_away": pl.Int64,
-        })
+        # Partido PFF sin mapping SB: fallback a PFF raw filtrando disallowed +
+        # shootout. Degradado pero no silencioso: PFF tiene falsos positivos
+        # (crosses duplicados, etc). Log WARNING para que el consumer lo vea.
+        warnings.warn(
+            f"[M03.goals_timeline] match_id={match_id} sin SB mapping; "
+            f"cayendo a PFF raw (may contain false positives). "
+            f"Consumers should treat score state as best-effort.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _goals_timeline_pff_fallback(match_id, home_id, away_id)
 
     ev = load_statsbomb_events(sb_mid)
     rows: list[dict] = []
@@ -194,12 +226,7 @@ def goals_timeline(match_id: int) -> pl.DataFrame:
             })
 
     if not rows:
-        return pl.DataFrame(schema={
-            "match_id": pl.Int64, "period": pl.Int64,
-            "start_game_clock": pl.Int64, "minute": pl.Int64,
-            "scoring_team_id": pl.Int64, "is_own_goal": pl.Boolean,
-            "cum_home": pl.Int64, "cum_away": pl.Int64,
-        })
+        return pl.DataFrame(schema=_GOALS_SCHEMA)
 
     df = pl.DataFrame(rows).sort("start_game_clock").with_columns([
         (pl.col("scoring_team_id") == home_id).cast(pl.Int64).cum_sum().alias("cum_home"),
@@ -296,7 +323,8 @@ def player_minutes(match_id: int) -> pl.DataFrame:
           .otherwise(None)
           .alias("minute_out"),
     ]).with_columns(
-        (pl.col("minute_out") - pl.col("minute_in")).fill_null(0).alias("minutes_played"),
+        (pl.col("minute_out") - pl.col("minute_in")).fill_null(0)
+         .clip(lower_bound=0).alias("minutes_played"),
         pl.col("sub_off_minute").is_not_null().alias("was_substituted_out"),
     ).drop(["sub_off_minute", "sub_on_minute"])
     return out.sort(["team_id", "minute_in"])
@@ -377,7 +405,6 @@ def enrich_events(match_id: int, cache: bool = True) -> pl.DataFrame:
 
 def cache_all_enriched(overwrite: bool = False) -> dict:
     """Precomputa enrich_events de los 64 partidos y cachea a parquet."""
-    from M01_loader_pff import list_event_match_ids
     out = {}
     for mid in list_event_match_ids():
         p = _DERIVED / "events_enriched" / f"{mid}.parquet"
@@ -393,7 +420,7 @@ def cache_all_enriched(overwrite: bool = False) -> dict:
 
 if __name__ == "__main__":
     import time
-    from M01_loader_pff import list_matches, list_event_match_ids
+    from M01_loader_pff import list_matches
 
     print("=== M03_preprocess sanity ===")
     inv = list_matches()

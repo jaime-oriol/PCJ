@@ -5,7 +5,8 @@ Reimplementacion Robberechts, Van Haaren & Davis (2021, KDD) en numpyro:
   - Ordered-logistic 3-class {H, D, A} con intercepts tiempo-variables
   - Random-walk prior sobre los 90 time-bins (smoothness temporal)
   - SVI (AutoNormal) para inferencia rapida CPU
-  - Features: score_diff, red_cards_diff, elo_diff, home_adv, tier
+  - Features: score_diff, red_diff, elo_diff, comp_tier, shots_diff_recent
+    (ventana rolling 10 min, proxy momentum ofensivo cross-dataset)
 
 Training cross-dataset (excluyendo WC22 sagrado):
   - Wyscout 2017/18 Big 5 + Euro16 + WC18  : 1.941 partidos
@@ -17,7 +18,7 @@ Cobertura completa 0-90 + ET + penaltis:
   - ET (90-120)    : Poisson goal-rate empirico sobre subset ET.
   - Penaltis tanda : Tijms (2019) formula cerrada.
 
-Calibracion: temperature scaling sobre 32 partidos WC22 fase de grupos
+Calibracion: temperature scaling sobre 48 partidos WC22 fase de grupos
 (NO sobre los 16 KO, que son sagrados para test final).
 
 Output: tabla `data/parquet/derived/wp/per_minute.parquet` con
@@ -41,10 +42,9 @@ if str(_SRC_DIR) not in sys.path:
 
 from M01_loader_pff import load_metadata as pff_meta, list_event_match_ids
 from M02_loader_public import (
-    WYSCOUT_COMPETITIONS, STATSBOMB_COMPETITIONS,
+    STATSBOMB_COMPETITIONS,
     scan_wyscout_events, load_wyscout_matches,
     load_statsbomb_matches, load_statsbomb_events, list_statsbomb_match_ids,
-    scan_statsbomb_events,
 )
 from M03_preprocess import goals_timeline as pff_goals_timeline
 
@@ -165,8 +165,7 @@ def _statsbomb_goals_timeline(match_ids: list[int]) -> pl.DataFrame:
             ).select([
                 pl.lit(mid).cast(pl.Int64).alias("match_id"),
                 pl.col("team").struct.field("id").alias("scoring_team_id"),
-                ((pl.col("period") - 1) * 45 + pl.col("minute")
-                 - pl.when(pl.col("period") >= 3).then(0).otherwise(0))
+                ((pl.col("period") - 1) * 45 + pl.col("minute"))
                 .cast(pl.Int64).alias("minute_abs"),
             ])
             rows.append(g)
@@ -182,6 +181,49 @@ def _statsbomb_goals_timeline(match_ids: list[int]) -> pl.DataFrame:
     out = pl.concat([r for r in rows if r.height > 0], how="diagonal_relaxed") \
         if rows else pl.DataFrame(schema={"match_id": pl.Int64, "scoring_team_id": pl.Int64, "minute_abs": pl.Int64})
     return out.with_columns(pl.lit("statsbomb").alias("source"))
+
+
+def _wyscout_shots_timeline() -> pl.DataFrame:
+    """Timeline de shots Wyscout: (match_id, minute_abs, team_id).
+
+    Shots = eventName in (Shot, Free Kick). Incluye shots que NO son gol.
+    Usado como proxy de momentum ofensivo en la ventana reciente.
+    """
+    ev = scan_wyscout_events().with_columns(
+        pl.col("matchPeriod").replace_strict(_WYSCOUT_PERIOD_OFFSET, default=0)
+                              .cast(pl.Int64).alias("period_offset"),
+        (pl.col("eventSec") / 60.0).alias("sec_min"),
+    ).with_columns(
+        (pl.col("period_offset") + pl.col("sec_min")).cast(pl.Int64).alias("minute_abs")
+    )
+    s = ev.filter(pl.col("eventName").is_in(["Shot", "Free Kick"])).select([
+        pl.col("matchId").alias("match_id"),
+        pl.col("teamId").alias("team_id"),
+        "minute_abs",
+    ]).collect().with_columns(pl.lit("wyscout").alias("source"))
+    return s
+
+
+def _statsbomb_shots_timeline(match_ids: list[int]) -> pl.DataFrame:
+    """Timeline de shots StatsBomb: type.name == 'Shot'."""
+    rows = []
+    for mid in match_ids:
+        ev = load_statsbomb_events(mid)
+        shots = ev.filter(pl.col("type").struct.field("name") == "Shot")
+        if shots.height == 0:
+            continue
+        s = shots.select([
+            pl.lit(mid).cast(pl.Int64).alias("match_id"),
+            pl.col("team").struct.field("id").alias("team_id"),
+            ((pl.col("period") - 1) * 45 + pl.col("minute")).cast(pl.Int64).alias("minute_abs"),
+        ])
+        rows.append(s)
+    if not rows:
+        return pl.DataFrame(schema={"match_id": pl.Int64, "team_id": pl.Int64,
+                                      "minute_abs": pl.Int64})
+    return pl.concat(rows, how="diagonal_relaxed").with_columns(
+        pl.lit("statsbomb").alias("source")
+    )
 
 
 def _statsbomb_reds_timeline(match_ids: list[int]) -> pl.DataFrame:
@@ -375,11 +417,51 @@ def compute_elo(meta: pl.DataFrame, k: float = ELO_K,
 #  SECCION 4 — Training matrix (match_id x minute_bin 1..90)
 # ===========================================================================
 
+_SHOTS_WINDOW = 10   # minutos de la ventana rolling para shots_diff_recent
+
+
+def _counts_per_match_minute(events: pl.DataFrame, meta: pl.DataFrame,
+                             team_col: str) -> np.ndarray:
+    """Para cada (match, minute_bin 1..90), cuenta eventos del home y del away.
+
+    Devuelve ndarray (n_matches, 90, 2) int32: [:, :, 0]=home, [:, :, 1]=away.
+    Este formato permite cum_sum y rolling sum via operaciones numpy
+    vectorizadas (mas barato que joins cross × bins × events).
+    """
+    if events.height == 0:
+        return np.zeros((meta.height, REG_MINUTES, 2), dtype=np.int32)
+
+    joined = events.join(
+        meta.select(["match_id", "home_team_id", "away_team_id"]),
+        on="match_id", how="inner",
+    ).with_columns(
+        pl.when(pl.col(team_col) == pl.col("home_team_id")).then(0)
+          .when(pl.col(team_col) == pl.col("away_team_id")).then(1)
+          .otherwise(None)
+          .alias("side_idx"),
+        pl.col("minute_abs").clip(1, REG_MINUTES).alias("bin"),
+    ).filter(pl.col("side_idx").is_not_null()).select(["match_id", "bin", "side_idx"])
+
+    mid_to_row = {m: i for i, m in enumerate(meta["match_id"].to_list())}
+    counts = np.zeros((len(mid_to_row), REG_MINUTES, 2), dtype=np.int32)
+    for mid, b, s in zip(joined["match_id"].to_list(),
+                          joined["bin"].to_list(),
+                          joined["side_idx"].to_list()):
+        row = mid_to_row.get(mid)
+        if row is not None:
+            counts[row, b - 1, s] += 1
+    return counts
+
+
 def build_training_matrix(cache: bool = True) -> tuple[pl.DataFrame, dict]:
-    """Construye matrix (match_id, minute, score_diff, red_diff, elo_diff, tier, y).
+    """Construye matrix (match_id, minute, [features], y).
+
+    Features siguen Robberechts et al. 2021:
+      score_diff, red_diff, elo_diff, comp_tier, shots_diff_recent.
 
     y: target multinomial {0=H, 1=D, 2=A} al final de los 90 minutos regulares.
-    Cacheable a parquet.
+    Vectorizacion: counts por (match × minute × side) como ndarray, cum_sum
+    para goles/rojas, rolling-10 para shots. Cacheable a parquet.
     """
     cache_path = _CACHE / "training_matrix.parquet"
     if cache and cache_path.exists():
@@ -389,14 +471,17 @@ def build_training_matrix(cache: bool = True) -> tuple[pl.DataFrame, dict]:
     # 1. Timelines cross-dataset
     g_wy = _wyscout_goals_timeline()
     r_wy = _wyscout_reds_timeline()
+    sh_wy = _wyscout_shots_timeline()
     sb_mids = [mid for cid, sid in STATSBOMB_COMPETITIONS.values()
                if (cid, sid) != (43, 106)
                for mid in list_statsbomb_match_ids(comp_id=cid, season_id=sid)]
     g_sb = _statsbomb_goals_timeline(sb_mids)
     r_sb = _statsbomb_reds_timeline(sb_mids)
+    sh_sb = _statsbomb_shots_timeline(sb_mids)
 
     goals_all = pl.concat([g_wy, g_sb], how="diagonal_relaxed")
     reds_all  = pl.concat([r_wy, r_sb], how="diagonal_relaxed")
+    shots_all = pl.concat([sh_wy, sh_sb], how="diagonal_relaxed")
 
     # 2. Metadata unificada
     wy_meta = _wyscout_match_meta()
@@ -414,86 +499,57 @@ def build_training_matrix(cache: bool = True) -> tuple[pl.DataFrame, dict]:
           .alias("y")
     )
 
-    # 5. Generar bins 1..90 x matches
-    bins = pl.DataFrame({"minute_bin": list(range(1, REG_MINUTES + 1))})
-    grid = meta.join(bins, how="cross")
+    # 5. Counts por (match × minute × side) — ndarray compacto
+    goals_c = _counts_per_match_minute(goals_all, meta, "scoring_team_id")
+    reds_c  = _counts_per_match_minute(reds_all,  meta, "team_id")
+    shots_c = _counts_per_match_minute(shots_all, meta, "team_id")
 
-    # 6. Score/red cumulative at minute_bin: para cada match bin, count goals/reds
-    #    del home (scoring_team_id == home_team_id) y del away con minute_abs <= bin.
+    # Cumulativos para goles/rojas (shape match × bin × side)
+    #  - "eventos en minuto m" se asignan al bin m. El score al INICIO del bin
+    #    m es el cum hasta m-1. Usamos cumsum shifted: pad 1 delante y recorta.
+    gc_cum = np.cumsum(goals_c, axis=1)                          # count al final del bin
+    rc_cum = np.cumsum(reds_c,  axis=1)
+    # Score/red "antes de" el bin m = count en bins < m -> shift +1 en eje minute
+    gc_pre = np.concatenate([np.zeros_like(gc_cum[:, :1, :]),
+                              gc_cum[:, :-1, :]], axis=1)
+    rc_pre = np.concatenate([np.zeros_like(rc_cum[:, :1, :]),
+                              rc_cum[:, :-1, :]], axis=1)
 
-    def _cum_by_team(timeline: pl.DataFrame, team_col: str) -> pl.DataFrame:
-        """Cumulative count por (match_id, team_role) hasta minute_bin."""
-        # clip minute_abs a [1, 90]: eventos stoppage del 1H (min 46-47) cuentan en bin 45+
-        tl = timeline.with_columns(
-            pl.col("minute_abs").clip(1, REG_MINUTES).alias("ma_clip")
-        )
-        return tl
+    # Rolling shots_diff_recent: sum de shots en los W minutos anteriores al bin
+    # (ventana abierta por la derecha: [bin-W, bin-1]). Eficiente via diff de cumsum.
+    shots_cum = np.cumsum(shots_c, axis=1)
+    shots_pre = np.concatenate([np.zeros_like(shots_cum[:, :1, :]),
+                                 shots_cum[:, :-1, :]], axis=1)       # <=bin-1
+    w = _SHOTS_WINDOW
+    shots_before_window = np.concatenate([
+        np.zeros_like(shots_cum[:, :w, :]),
+        shots_cum[:, :REG_MINUTES - w, :],
+    ], axis=1)                                                        # <=bin-1-w
+    shots_win = shots_pre - shots_before_window                       # ventana (bin-w..bin-1)
 
-    # Home cumulative goals
-    goals_aligned = goals_all.join(
-        meta.select(["match_id", "home_team_id", "away_team_id"]),
-        on="match_id", how="inner"
-    ).with_columns(
-        pl.when(pl.col("scoring_team_id") == pl.col("home_team_id")).then(pl.lit("H"))
-          .when(pl.col("scoring_team_id") == pl.col("away_team_id")).then(pl.lit("A"))
-          .otherwise(pl.lit(None, dtype=pl.String))
-          .alias("for_side")
-    ).filter(pl.col("for_side").is_not_null())
+    n_m = meta.height
+    match_ids = np.repeat(meta["match_id"].to_numpy(), REG_MINUTES)
+    minute_bin = np.tile(np.arange(1, REG_MINUTES + 1, dtype=np.int64), n_m)
 
-    reds_aligned = reds_all.join(
-        meta.select(["match_id", "home_team_id", "away_team_id"]),
-        on="match_id", how="inner"
-    ).with_columns(
-        pl.when(pl.col("team_id") == pl.col("home_team_id")).then(pl.lit("H"))
-          .when(pl.col("team_id") == pl.col("away_team_id")).then(pl.lit("A"))
-          .otherwise(pl.lit(None, dtype=pl.String))
-          .alias("for_side")
-    ).filter(pl.col("for_side").is_not_null())
+    score_diff = (gc_pre[:, :, 0] - gc_pre[:, :, 1]).reshape(-1).astype(np.int64)
+    red_diff   = (rc_pre[:, :, 0] - rc_pre[:, :, 1]).reshape(-1).astype(np.int64)
+    shots_diff = (shots_win[:, :, 0] - shots_win[:, :, 1]).reshape(-1).astype(np.int64)
 
-    def _cum_at_bin(events: pl.DataFrame, side: str) -> pl.DataFrame:
-        e = events.filter(pl.col("for_side") == side).select(["match_id", "minute_abs"])
-        # Para cada match, para cada bin, count events with minute_abs <= bin
-        # Equivalente a sort + cum_count tras cross.
-        e2 = e.with_columns(pl.col("minute_abs").clip(1, REG_MINUTES).alias("minute_abs"))
-        return e2
+    elo_diff = (meta["elo_home_pre"].to_numpy()
+                - meta["elo_away_pre"].to_numpy())
+    comp_tier = meta["comp_tier"].to_numpy()
+    y = meta["y"].to_numpy()
 
-    goals_h = _cum_at_bin(goals_aligned, "H")
-    goals_a = _cum_at_bin(goals_aligned, "A")
-    reds_h  = _cum_at_bin(reds_aligned,  "H")
-    reds_a  = _cum_at_bin(reds_aligned,  "A")
-
-    # Agregar por (match_id, minute_abs) para cum por minuto
-    def _aggregate_cum(ev: pl.DataFrame, col_name: str) -> pl.DataFrame:
-        """Para cada match, cum sum por minute."""
-        e = ev.group_by(["match_id", "minute_abs"]).len().rename({"len": "cnt"})
-        # Producto con bins y cum_sum
-        per_match_bins = e.join(bins, how="cross").filter(
-            pl.col("minute_abs") <= pl.col("minute_bin")
-        ).group_by(["match_id", "minute_bin"]).agg(pl.col("cnt").sum().alias(col_name))
-        return per_match_bins
-
-    gh_cum = _aggregate_cum(goals_h, "gh_cum")
-    ga_cum = _aggregate_cum(goals_a, "ga_cum")
-    rh_cum = _aggregate_cum(reds_h,  "rh_cum")
-    ra_cum = _aggregate_cum(reds_a,  "ra_cum")
-
-    X = grid.join(gh_cum, on=["match_id","minute_bin"], how="left") \
-            .join(ga_cum, on=["match_id","minute_bin"], how="left") \
-            .join(rh_cum, on=["match_id","minute_bin"], how="left") \
-            .join(ra_cum, on=["match_id","minute_bin"], how="left") \
-        .with_columns([
-            pl.col("gh_cum").fill_null(0).cast(pl.Int64),
-            pl.col("ga_cum").fill_null(0).cast(pl.Int64),
-            pl.col("rh_cum").fill_null(0).cast(pl.Int64),
-            pl.col("ra_cum").fill_null(0).cast(pl.Int64),
-        ]).with_columns([
-            (pl.col("gh_cum") - pl.col("ga_cum")).cast(pl.Int64).alias("score_diff"),
-            (pl.col("rh_cum") - pl.col("ra_cum")).cast(pl.Int64).alias("red_diff"),
-            (pl.col("elo_home_pre") - pl.col("elo_away_pre")).alias("elo_diff"),
-        ]).select([
-            "match_id", "minute_bin", "score_diff", "red_diff",
-            "elo_diff", "comp_tier", "y",
-        ])
+    X = pl.DataFrame({
+        "match_id":           match_ids,
+        "minute_bin":         minute_bin,
+        "score_diff":         score_diff,
+        "red_diff":           red_diff,
+        "elo_diff":           np.repeat(elo_diff, REG_MINUTES).astype(np.float64),
+        "comp_tier":          np.repeat(comp_tier, REG_MINUTES).astype(np.int64),
+        "shots_diff_recent":  shots_diff,
+        "y":                  np.repeat(y, REG_MINUTES).astype(np.int64),
+    })
 
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -527,11 +583,10 @@ def _wp_model(X_feat, minute_bin, y=None, n_bins: int = N_BINS):
     alpha_D0 = numpyro.sample("alpha_D0", dist.Normal(1.0, 2.0))
 
     dH = numpyro.sample("dH", dist.Normal(0.0, 1.0).expand([n_bins-1]).to_event(1)) * sigma_rw
-    dD = numpyro.sample("dD", dist.Normal(0.0, 1.0).expand([n_bins-1]).to_event(1)) * sigma_rw
 
     alphaH_t = jnp.concatenate([jnp.array([alpha_H0]), alpha_H0 + jnp.cumsum(dH)])
-    gap_base = jnp.exp(alpha_D0 - alpha_H0)      # garantiza alpha_D > alpha_H
-    alphaD_t = alphaH_t + gap_base * jnp.ones(n_bins)
+    gap_base = jnp.exp(alpha_D0 - alpha_H0)      # gap constante > 0 asegura alpha_D > alpha_H
+    alphaD_t = alphaH_t + gap_base
 
     linpred = jnp.dot(X_feat, beta)               # (n,)
     aH = alphaH_t[minute_bin]
@@ -557,7 +612,8 @@ def fit_wp(X: pl.DataFrame, n_steps: int = 3000, seed: int = 0) -> dict:
     from numpyro.infer import SVI, Trace_ELBO
     from numpyro.infer.autoguide import AutoNormal
 
-    feat_cols = ["score_diff", "red_diff", "elo_diff", "comp_tier"]
+    feat_cols = ["score_diff", "red_diff", "elo_diff", "comp_tier",
+                 "shots_diff_recent"]
     # Estandarizar (media 0, std 1) para eficiencia SVI
     feat_stats = {}
     X_np = X.select(feat_cols).to_numpy().astype(np.float32)
@@ -591,7 +647,6 @@ def _derive_alphas(params: dict) -> tuple[np.ndarray, np.ndarray]:
     aD0 = float(params["alpha_D0_auto_loc"])
     sigma = float(np.exp(params["sigma_rw_auto_loc"]))
     dH = np.array(params["dH_auto_loc"], dtype=np.float32) * sigma
-    dD = np.array(params["dD_auto_loc"], dtype=np.float32) * sigma  # noqa: F841
     alphaH_t = np.concatenate([[aH0], aH0 + np.cumsum(dH)])
     gap = float(np.exp(aD0 - aH0))
     alphaD_t = alphaH_t + gap
@@ -716,6 +771,20 @@ def evaluate_brier_per_minute(X_val: pl.DataFrame, fit_result: dict) -> pl.DataF
 
 # -- Temperature scaling ----------------------------------------------------
 
+def _pff_shots_timeline_match(match_id: int, home_id: int) -> tuple[list[int], list[int]]:
+    """Devuelve (minutos_shots_home, minutos_shots_away) en [0,90] para 1 match PFF."""
+    from M01_loader_pff import list_shots
+    s = list_shots(match_id).filter(pl.col("minute") < REG_MINUTES)
+    sh = s.filter(pl.col("team_id") == home_id)["minute"].to_list()
+    sa = s.filter(pl.col("team_id") != home_id)["minute"].to_list()
+    return sh, sa
+
+
+def _shots_recent_at(shots_minutes: list[int], m: int, w: int = _SHOTS_WINDOW) -> int:
+    """Cuenta shots en la ventana [m-w, m-1]."""
+    return sum(1 for x in shots_minutes if m - w <= x <= m - 1)
+
+
 def build_wc22_groups_calib_matrix() -> pl.DataFrame:
     """Matrix de calibracion: 48 partidos fase grupos WC22 x 90 bins.
 
@@ -733,15 +802,19 @@ def build_wc22_groups_calib_matrix() -> pl.DataFrame:
         g = pff_goals_timeline(mid)   # excluye disallowed + shootout
         gh = g.filter(pl.col("scoring_team_id") == home_id)["minute"].to_list()
         ga = g.filter(pl.col("scoring_team_id") != home_id)["minute"].to_list()
+        sh_pff, sa_pff = _pff_shots_timeline_match(mid, home_id)
         sh_90 = sum(1 for x in gh if x < REG_MINUTES)
         sa_90 = sum(1 for x in ga if x < REG_MINUTES)
         y = 0 if sh_90 > sa_90 else (2 if sh_90 < sa_90 else 1)
         for m in range(1, REG_MINUTES + 1):
             sd = sum(1 for x in gh if x < m) - sum(1 for x in ga if x < m)
+            sdr = _shots_recent_at(sh_pff, m) - _shots_recent_at(sa_pff, m)
             rows.append({
                 "match_id": mid, "minute_bin": m,
                 "score_diff": sd, "red_diff": 0,
-                "elo_diff": 0.0, "comp_tier": 3, "y": y,
+                "elo_diff": 0.0, "comp_tier": 3,
+                "shots_diff_recent": sdr,
+                "y": y,
             })
     return pl.DataFrame(rows)
 
@@ -860,43 +933,43 @@ def _pff_goals_home_away(match_id: int) -> pl.DataFrame:
     ])
 
 
-def _wp_et_poisson(score_diff_90: int, minute_et: int,
-                   lam_h: float, lam_a: float,
-                   prob_shootout_home: float) -> tuple[float, float, float]:
-    """WP durante ET via Poisson goal arrival sobre los 30 min restantes de ET.
+def _wp_et_poisson_batch(score_diff_90: np.ndarray, minute_et: np.ndarray,
+                         lam_h: float, lam_a: float,
+                         prob_shootout_home: float,
+                         max_g: int = 6) -> np.ndarray:
+    """Vectorizado: WP durante ET via Poisson outer product para N minutos.
 
-    Una vez llegado al minuto 120, si empate -> penaltis (shootout prob).
-    Devuelve (wp_home, wp_draw, wp_away) donde "draw" aqui significa "llegara
-    a penaltis" y el outcome final del partido si hay penaltis lo deriva
-    prob_shootout_home (P home gana tanda).
+    Args:
+        score_diff_90 : (N,) score_diff antes de ET en cada instante.
+        minute_et     : (N,) minuto dentro de ET (1..30).
+    Returns:
+        (N, 3) wp_home, wp_draw, wp_away. Draw siempre 0 (tanda resuelve).
     """
-    # minutos restantes de ET hasta 120
-    minutes_left = max(0, ET_MINUTES - minute_et)
-    mean_h = lam_h * minutes_left
-    mean_a = lam_a * minutes_left
-    # Truncamos Poisson a 0..5 goles (prob extra negligible)
-    max_g = 6
-    from math import exp, factorial
-    def poisson(k, mu): return np.exp(-mu) * mu**k / factorial(k)
-    p_gh = np.array([poisson(k, mean_h) for k in range(max_g)])
-    p_ga = np.array([poisson(k, mean_a) for k in range(max_g)])
-    p_gh /= p_gh.sum(); p_ga /= p_ga.sum()
-    # Distribucion conjunta del marcador FINAL de ET
-    # final_diff = score_diff_90 + (gh - ga)
-    p_H_reg, p_D_reg, p_A_reg = 0.0, 0.0, 0.0
-    for h in range(max_g):
-        for a in range(max_g):
-            w = p_gh[h] * p_ga[a]
-            final_diff = score_diff_90 + (h - a)
-            if final_diff > 0:   p_H_reg += w
-            elif final_diff < 0: p_A_reg += w
-            else:                p_D_reg += w
-    # p_D_reg = P(ET acaba en empate) -> hay penaltis.
-    # En ese caso, prob_shootout_home determina quien gana.
+    from math import factorial
+    minutes_left = np.clip(ET_MINUTES - minute_et, 0, ET_MINUTES).astype(np.float64)
+    mean_h = lam_h * minutes_left                                  # (N,)
+    mean_a = lam_a * minutes_left                                  # (N,)
+    ks = np.arange(max_g)
+    fact = np.array([factorial(k) for k in ks], dtype=np.float64)
+
+    # P(k goles) truncado Poisson: (N, max_g)
+    p_gh = np.exp(-mean_h[:, None]) * (mean_h[:, None] ** ks[None, :]) / fact[None, :]
+    p_ga = np.exp(-mean_a[:, None]) * (mean_a[:, None] ** ks[None, :]) / fact[None, :]
+    p_gh /= p_gh.sum(axis=1, keepdims=True)
+    p_ga /= p_ga.sum(axis=1, keepdims=True)
+
+    # joint (N, max_g, max_g): joint[i, h, a] = p_gh[i,h] * p_ga[i,a]
+    joint = p_gh[:, :, None] * p_ga[:, None, :]
+    diff  = ks[None, :, None] - ks[None, None, :]                   # (1, max_g, max_g)
+    final = score_diff_90[:, None, None] + diff                     # (N, max_g, max_g)
+    p_H_reg = np.where(final > 0, joint, 0.0).sum(axis=(1, 2))
+    p_A_reg = np.where(final < 0, joint, 0.0).sum(axis=(1, 2))
+    p_D_reg = 1.0 - p_H_reg - p_A_reg
+
     p_H = p_H_reg + p_D_reg * prob_shootout_home
-    p_A = p_A_reg + p_D_reg * (1 - prob_shootout_home)
-    p_D = 0.0  # al final, nadie empata (tanda resuelve)
-    return float(p_H), float(p_D), float(p_A)
+    p_A = p_A_reg + p_D_reg * (1.0 - prob_shootout_home)
+    p_D = np.zeros_like(p_H)
+    return np.stack([p_H, p_D, p_A], axis=1)
 
 
 def compute_wp_per_minute(match_id: int, fit_result: dict,
@@ -932,44 +1005,70 @@ def compute_wp_per_minute(match_id: int, fit_result: dict,
     gh = goals.filter(pl.col("scoring_side") == "H")["minute"].to_list()
     ga = goals.filter(pl.col("scoring_side") == "A")["minute"].to_list()
 
-    # Proxy fiable de si el partido fue a ET: home_team_start_left_et no-null
-    # (solo se rellena en partidos que realmente jugaron prorroga).
+    # Shots PFF para shots_diff_recent
     md = pff_meta(match_id).row(0, named=True)
+    sh_pff, sa_pff = _pff_shots_timeline_match(match_id, md["home_team_id"])
+
     went_to_et = md["home_team_start_left_et"] is not None
 
-    rows = []
-    # --- Regulacion 1..90 ---
-    for m in range(1, REG_MINUTES + 1):
-        sd = sum(1 for x in gh if x < m) - sum(1 for x in ga if x < m)
-        fv = {"score_diff": sd, "red_diff": 0, "elo_diff": elo_diff,
-              "comp_tier": comp_tier}
-        pH, pD, pA = predict_wp(fv, m, fit_result)
-        fv_plus = {**fv, "score_diff": sd + 1}
-        pH_plus, _, _ = predict_wp(fv_plus, m, fit_result)
-        leverage = abs(pH_plus - pH)
-        rows.append({
-            "match_id": match_id, "minute": m,
-            "wp_home": pH, "wp_draw": pD, "wp_away": pA,
-            "leverage": leverage, "score_diff": sd, "phase": "regulation",
-        })
+    # --- Regulacion 1..90 vectorizado ---
+    mins_reg = np.arange(1, REG_MINUTES + 1)
+    gh_arr = np.array(gh, dtype=np.int64)
+    ga_arr = np.array(ga, dtype=np.int64)
+    sd_reg = np.array([(gh_arr < m).sum() - (ga_arr < m).sum()
+                       for m in mins_reg], dtype=np.int64)
+    sdr_reg = np.array([_shots_recent_at(sh_pff, int(m))
+                         - _shots_recent_at(sa_pff, int(m)) for m in mins_reg],
+                        dtype=np.int64)
+    X_reg = pl.DataFrame({
+        "minute_bin":        mins_reg,
+        "score_diff":        sd_reg,
+        "red_diff":          np.zeros(REG_MINUTES, dtype=np.int64),
+        "elo_diff":          np.full(REG_MINUTES, elo_diff, dtype=np.float64),
+        "comp_tier":         np.full(REG_MINUTES, comp_tier, dtype=np.int64),
+        "shots_diff_recent": sdr_reg,
+    })
+    probs_reg = predict_wp_batch(X_reg, fit_result)
+    probs_plus = predict_wp_batch(
+        X_reg.with_columns((pl.col("score_diff") + 1).alias("score_diff")),
+        fit_result,
+    )
+    lev_reg = np.abs(probs_plus[:, 0] - probs_reg[:, 0])
 
-    # --- ET 91..120 (solo si el partido realmente jugo prorroga) ---
+    reg_df = pl.DataFrame({
+        "match_id":   np.full(REG_MINUTES, match_id, dtype=np.int64),
+        "minute":     mins_reg,
+        "wp_home":    probs_reg[:, 0],
+        "wp_draw":    probs_reg[:, 1],
+        "wp_away":    probs_reg[:, 2],
+        "leverage":   lev_reg,
+        "score_diff": sd_reg,
+        "phase":      ["regulation"] * REG_MINUTES,
+    })
+
     if went_to_et:
-        for m in range(REG_MINUTES + 1, REG_MINUTES + ET_MINUTES + 1):
-            sd = sum(1 for x in gh if x < m) - sum(1 for x in ga if x < m)
-            minute_et = m - REG_MINUTES
-            pH, pD, pA = _wp_et_poisson(sd, minute_et, lam_et_h, lam_et_a,
-                                         prob_shootout_home)
-            pH_plus, _, _ = _wp_et_poisson(sd + 1, minute_et, lam_et_h, lam_et_a,
-                                            prob_shootout_home)
-            leverage = abs(pH_plus - pH)
-            rows.append({
-                "match_id": match_id, "minute": m,
-                "wp_home": pH, "wp_draw": pD, "wp_away": pA,
-                "leverage": leverage, "score_diff": sd, "phase": "extra_time",
-            })
-
-    df = pl.DataFrame(rows)
+        mins_et = np.arange(REG_MINUTES + 1, REG_MINUTES + ET_MINUTES + 1)
+        minute_et = mins_et - REG_MINUTES
+        sd_et = np.array([(gh_arr < m).sum() - (ga_arr < m).sum()
+                          for m in mins_et], dtype=np.int64)
+        probs_et = _wp_et_poisson_batch(sd_et, minute_et,
+                                         lam_et_h, lam_et_a, prob_shootout_home)
+        probs_et_plus = _wp_et_poisson_batch(sd_et + 1, minute_et,
+                                              lam_et_h, lam_et_a, prob_shootout_home)
+        lev_et = np.abs(probs_et_plus[:, 0] - probs_et[:, 0])
+        et_df = pl.DataFrame({
+            "match_id":   np.full(ET_MINUTES, match_id, dtype=np.int64),
+            "minute":     mins_et,
+            "wp_home":    probs_et[:, 0],
+            "wp_draw":    probs_et[:, 1],
+            "wp_away":    probs_et[:, 2],
+            "leverage":   lev_et,
+            "score_diff": sd_et,
+            "phase":      ["extra_time"] * ET_MINUTES,
+        })
+        df = pl.concat([reg_df, et_df])
+    else:
+        df = reg_df
 
     # Elimination proximity:
     #  - Partidos de GRUPOS (match_id < 10500): Monte Carlo del grupo, considera
@@ -1077,13 +1176,8 @@ def build_wc22_group_context() -> dict:
     for g in group_teams:
         group_teams[g].sort()   # orden determinista
 
-    # Resultados FINALES de los 48 partidos de fase grupos (week 1-3)
-    # Derivar de list_goals validos (no disallowed, no shootout) por match.
-    from M01_loader_pff import list_goals
-    g_all = list_goals().filter(~pl.col("disallowed") & ~pl.col("shootout"))
-
-    # Necesitamos resolver own goals: scoring_team real del gol
-    # Usamos M03 goals_timeline (que ya resuelve own-goals por keeper team)
+    # Resultados FINALES de los 48 partidos de fase grupos (week 1-3):
+    # usamos M03 goals_timeline (SB como ground truth, ya resuelve own-goals).
     group_matches: dict[str, list[dict]] = {g: [] for g in _WC22_GROUPS}
     match_to_group: dict[int, str] = {}
     match_dates: dict[int, str] = {}
@@ -1292,12 +1386,12 @@ if __name__ == "__main__":
     t0 = time.time()
     X, info = build_training_matrix(cache=True)
     print(f"training matrix: {info} en {time.time()-t0:.1f}s")
-    print(f"  dtypes: score_diff={X.schema['score_diff']} "
-          f"red_diff={X.schema['red_diff']} elo_diff={X.schema['elo_diff']}")
     print(f"  y distrib: {X.group_by('y').len().sort('y').to_dicts()}")
-    print(f"  score_diff range: [{X['score_diff'].min()}, {X['score_diff'].max()}]")
-    print(f"  red_diff   range: [{X['red_diff'].min()}, {X['red_diff'].max()}]")
-    print(f"  elo_diff   range: [{X['elo_diff'].min():.0f}, {X['elo_diff'].max():.0f}]")
+    print(f"  score_diff         range: [{X['score_diff'].min()}, {X['score_diff'].max()}]")
+    print(f"  red_diff           range: [{X['red_diff'].min()}, {X['red_diff'].max()}]")
+    print(f"  elo_diff           range: [{X['elo_diff'].min():.0f}, {X['elo_diff'].max():.0f}]")
+    print(f"  shots_diff_recent  range: [{X['shots_diff_recent'].min()}, "
+          f"{X['shots_diff_recent'].max()}]  mean_abs={X['shots_diff_recent'].abs().mean():.2f}")
 
     # 2. Split train/val + fit
     X_tr, X_val = train_val_split(X, val_frac=0.2, seed=42)
@@ -1344,7 +1438,8 @@ if __name__ == "__main__":
         (0, 45,   0.0, 3, "0-0 HT neutral"),
     ]:
         p = predict_wp({"score_diff": sd, "red_diff": 0, "elo_diff": elo,
-                        "comp_tier": tier}, minute, fit)
+                        "comp_tier": tier, "shots_diff_recent": 0},
+                        minute, fit)
         print(f"  {label:<25} H={p[0]:.3f} D={p[1]:.3f} A={p[2]:.3f}")
 
     # 7. compute_wp_per_minute ET sanity (NED-ARG 10511)

@@ -18,19 +18,21 @@ Pipeline:
   1. Load SB events via StatsBombLoader (socceraction nativo).
   2. Convert to SPADL -> Atomic SPADL (convert_to_atomic).
   3. Extract features + labels (compute_features, compute_labels).
-  4. Train CatBoost split 80/20 by match.
+  4. Optuna tuning (TPE, 3-fold CV by match) + train CatBoost 5-fold CV by match
+     + isotonic calibration + final model sobre todo el training.
   5. Apply a WC22 atomic actions -> offensive_value per action.
   6. Aggregate: (match_id, player_id_sb, minute, score_atk_minute, n_actions).
-  7. Map player_id_sb -> player_id_pff via nombre+equipo (para join con M07).
+  7. Map player_id_sb -> player_id_pff (nombre+equipo exacto, fallback last-name
+     unico dentro del equipo).
   8. Aggregate per shock-window (pre/post -10/+10 min).
 
 Output:
   data/parquet/derived/ataque/
-    atomic_training.parquet      # atomic actions training (cached)
-    atomic_wc22.parquet          # atomic actions WC22 (cached)
-    model/vaep_atk.*.cbm         # modelos CatBoost
-    per_minute.parquet           # (match_id, player_id_sb/pff, minute, score_atk_minute)
-    per_shock_window.parquet     # (match_id, shock_id, player_id_pff, score_atk_pre, score_atk_post)
+    training_atomic.parquet      # atomic actions training (cached)
+    wc22_atomic.parquet          # atomic actions WC22 (cached)
+    model/vaep_atk_{scores,concedes}.cbm + vaep_atk_meta.pkl
+    per_minute.parquet           # (sb_match_id, sb_player_id, minute, score_atk_minute, ...)
+    per_shock_window.parquet     # (match_id, shock_id, pff_player_id, shock_type, pre/post)
     sb_to_pff_player_map.parquet # mapping explicito
 
 Acceptance (ARCHITECTURE): distribucion score_atk por rol coherente (CFs > CBs).
@@ -138,17 +140,61 @@ def _get_match_folds(match_ids: np.ndarray, n_folds: int,
     return [np.array(f) for f in np.array_split(uniq, n_folds)]
 
 
+def tune_catboost_hparams(X_all: pd.DataFrame, y: np.ndarray,
+                           match_ids: np.ndarray, n_trials: int = 30,
+                           seed: int = 42) -> dict:
+    """Optuna tuning para CatBoost con 3-fold CV by match (log-loss objective).
+
+    Usamos 3 folds para que cada trial sea barato. Espacio de busqueda:
+      depth [4, 8], learning_rate log[0.01, 0.2], l2_leaf_reg log[1, 20],
+      bagging_temperature [0, 1], iterations 600 + early stopping.
+    """
+    import optuna
+    from catboost import CatBoostClassifier
+    from sklearn.metrics import log_loss
+
+    folds_3 = _get_match_folds(match_ids, 3, seed)
+
+    def objective(trial: optuna.Trial) -> float:
+        params = dict(
+            iterations=600,
+            depth=trial.suggest_int("depth", 4, 8),
+            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
+            bagging_temperature=trial.suggest_float("bagging_temperature", 0.0, 1.0),
+            eval_metric="Logloss", task_type="CPU",
+            random_seed=seed, verbose=0,
+        )
+        oof = np.zeros(len(X_all), dtype=np.float32)
+        for fi, val_m in enumerate(folds_3):
+            val_mask = np.isin(match_ids, val_m)
+            tr_mask  = ~val_mask
+            m = CatBoostClassifier(**params)
+            m.fit(X_all.iloc[tr_mask], y[tr_mask],
+                  eval_set=(X_all.iloc[val_mask], y[val_mask]),
+                  early_stopping_rounds=40, verbose=0)
+            oof[val_mask] = m.predict_proba(X_all.iloc[val_mask])[:, 1]
+        return float(log_loss(y, np.clip(oof, 1e-6, 1 - 1e-6)))
+
+    study = optuna.create_study(direction="minimize",
+                                 sampler=optuna.samplers.TPESampler(seed=seed))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    return study.best_params
+
+
 def train_vaep_model(atomic_df: pd.DataFrame,
                      n_folds: int = 5,
-                     seed: int = 42) -> dict:
+                     seed: int = 42,
+                     tune: bool = True,
+                     n_trials: int = 30) -> dict:
     """Entrena atomic-VAEP TOP RIGUROSO via CatBoost.
 
     Pipeline:
-      1. 5-fold CV stratified by match (evita leakage intra-partido).
-      2. OOF predictions raw para AMBOS modelos (scores, concedes).
-      3. Isotonic calibration sobre OOF -> calibrated OOF.
-      4. Train AUC vs OOF AUC check (delta < 0.05 = no overfitting).
-      5. Permutation importance (top 15 features) para detectar leakage.
+      1. Optuna tuning opcional (3-fold CV by match, log-loss).
+      2. 5-fold CV stratified by match (evita leakage intra-partido).
+      3. OOF predictions raw para AMBOS modelos (scores, concedes).
+      4. Isotonic calibration sobre OOF -> calibrated OOF.
+      5. Train AUC vs OOF AUC check (delta < 0.05 = no overfitting).
       6. Modelos FINALES entrenados sobre TODO el training.
     """
     from catboost import CatBoostClassifier
@@ -162,9 +208,20 @@ def train_vaep_model(atomic_df: pd.DataFrame,
     match_ids = atomic_df["game_id"].to_numpy()
     folds = _get_match_folds(match_ids, n_folds, seed)
 
-    # CatBoost params (conservadores con early stopping)
+    # Hyperparam tuning (scores como objetivo; concedes usa mismos hparams -
+    # task simetrica, evita duplicar coste de Optuna).
+    if tune:
+        print(f"  Optuna tuning ({n_trials} trials, 3-fold, scores objective)...",
+              flush=True)
+        best_hp = tune_catboost_hparams(X_all, ys, match_ids,
+                                         n_trials=n_trials, seed=seed)
+        print(f"  best hparams: {best_hp}", flush=True)
+    else:
+        best_hp = dict(depth=6, learning_rate=0.05,
+                        l2_leaf_reg=3.0, bagging_temperature=0.5)
+
     cb_params = dict(
-        iterations=500, depth=6, learning_rate=0.05,
+        iterations=800, **best_hp,
         eval_metric="Logloss", task_type="CPU",
         random_seed=seed, verbose=0,
     )
@@ -285,6 +342,13 @@ def apply_vaep_to_wc22(fit: dict,
     if wc22_atomic is None:
         wc22_atomic = build_wc22_atomic(overwrite=False)
     X = vaep_mod.compute_features(wc22_atomic, atomic=True, provider="statsbomb_wc22")
+    # Schema consistency check vs training
+    expected_cols = getattr(fit["model_s"], "feature_names_", None)
+    if expected_cols is not None:
+        assert list(X.columns) == list(expected_cols), (
+            f"Feature mismatch train vs apply. extra={set(X.columns)-set(expected_cols)}; "
+            f"missing={set(expected_cols)-set(X.columns)}"
+        )
     # Raw predictions
     p_s = fit["model_s"].predict_proba(X)[:, 1]
     p_c = fit["model_c"].predict_proba(X)[:, 1]
@@ -293,8 +357,6 @@ def apply_vaep_to_wc22(fit: dict,
         p_s = fit["cal_s"].predict(p_s)
     if fit.get("cal_c") is not None:
         p_c = fit["cal_c"].predict(p_c)
-    # Apply VAEP formula
-    import pandas as pd
     values = vaep_mod._formula_mod(atomic=True).value(
         wc22_atomic.reset_index(drop=True),
         pd.Series(p_s), pd.Series(p_c),
@@ -387,29 +449,63 @@ def build_sb_to_pff_player_map(cache: bool = True) -> pl.DataFrame:
         pl.col("team_name"),
     ]).unique(subset=["pff_player_id"])
 
-    # Normalizacion de nombres: quitar tildes + lower + trim
+    # Normalizacion de nombres: NFKD (quita tildes) + lower + quita puntuacion
+    # + colapsa espacios. Ademas derivamos last_token para fallback por apellido.
+    import re
     import unicodedata
+    _punct_re = re.compile(r"[^a-z0-9 ]+")
+    _ws_re    = re.compile(r"\s+")
+
     def norm(s: str | None) -> str | None:
-        if s is None: return None
+        if s is None:
+            return None
         s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-        return s.lower().strip()
+        s = _punct_re.sub(" ", s.lower())
+        return _ws_re.sub(" ", s).strip()
 
-    sb_df = sb_df.with_columns(
+    def last_token(s: str | None) -> str | None:
+        if s is None:
+            return None
+        toks = s.split()
+        return toks[-1] if toks else None
+
+    sb_df = sb_df.with_columns([
         pl.col("sb_player_name").map_elements(norm, return_dtype=pl.String).alias("name_norm"),
+    ])
+    sb_df = sb_df.with_columns(
+        pl.col("name_norm").map_elements(last_token, return_dtype=pl.String).alias("last_norm")
     )
-    pff = pff.with_columns(
+    pff = pff.with_columns([
         pl.col("pff_player_name").map_elements(norm, return_dtype=pl.String).alias("name_norm"),
+    ])
+    pff = pff.with_columns(
+        pl.col("name_norm").map_elements(last_token, return_dtype=pl.String).alias("last_norm")
     )
 
-    # Join exacto por (name_norm, team_name)
+    # Pase 1: full (name_norm, team_name)
     mapping = sb_df.join(
-        pff,
-        on=["name_norm", "team_name"],
-        how="left",
+        pff.select(["pff_player_id", "pff_player_name", "team_name", "name_norm"]),
+        on=["name_norm", "team_name"], how="left",
+    )
+
+    # Pase 2: para SB sin pff_player_id, intentar (last_norm, team_name) si es unico
+    #         dentro del equipo en el lado PFF (evita falsos positivos por apellidos
+    #         comunes como "Silva" cuando hay varios Silva en la misma seleccion).
+    last_unique = pff.group_by(["last_norm", "team_name"]).agg([
+        pl.col("pff_player_id").first().alias("pff_id_by_last"),
+        pl.len().alias("n_last"),
+    ]).filter(pl.col("n_last") == 1)
+    mapping = mapping.join(
+        last_unique.select(["last_norm", "team_name", "pff_id_by_last"]),
+        on=["last_norm", "team_name"], how="left",
     ).with_columns(
+        pl.coalesce(["pff_player_id", "pff_id_by_last"]).alias("pff_player_id")
+    ).drop("pff_id_by_last")
+
+    mapping = mapping.with_columns([
         pl.col("sb_player_id").cast(pl.Int64),
         pl.col("pff_player_id").cast(pl.Int64, strict=False),
-    ).select(["sb_player_id", "sb_player_name", "team_name", "pff_player_id"])
+    ]).select(["sb_player_id", "sb_player_name", "team_name", "pff_player_id"])
 
     if cache:
         mapping.write_parquet(cache_path, compression="snappy")
@@ -449,7 +545,6 @@ def aggregate_per_shock_window(per_minute: pl.DataFrame,
 
     # Map SB match_id -> PFF match_id
     sb2pff = _sb_to_pff_match_map()
-    pff2sb = {v: k for k, v in sb2pff.items()}
     per_min = per_minute.with_columns(
         pl.col("sb_match_id").replace_strict(sb2pff, default=None).alias("match_id")
     ).filter(pl.col("match_id").is_not_null())
