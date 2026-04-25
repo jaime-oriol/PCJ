@@ -36,7 +36,7 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from M01_loader_pff import list_event_match_ids, load_events, load_metadata
+from M01_loader_pff import list_event_match_ids, load_events
 from M03_preprocess import goals_timeline, player_minutes
 
 
@@ -127,7 +127,6 @@ def build_shocks_table(cache: bool = True,
         goals = goals_timeline(mid)
         if goals.height == 0:
             continue
-        md = load_metadata(mid).row(0, named=True)
         pm = player_minutes(mid)
         p_bounds = _period_boundaries(mid)
 

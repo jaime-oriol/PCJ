@@ -27,7 +27,7 @@ Cache:
 Consumer: M06 near-miss (criterio "parada con PSxG >= 0.6" identifica paradas
 decisivas como cuasi-experimento exogeno tipo Gauriot & Page 2019).
 
-Depende de: M02 (loader SB), M03 (no directo, pero goals_timeline cross-check).
+Depende de: M02 (loader SB).
 """
 
 from __future__ import annotations

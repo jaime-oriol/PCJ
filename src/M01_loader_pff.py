@@ -167,11 +167,9 @@ def _flatten_events(lf: pl.LazyFrame) -> pl.LazyFrame:
         pl.col("gameEvents").struct.field("startGameClock").alias("start_game_clock"),
         pl.col("gameEvents").struct.field("teamId").alias("team_id"),
         pl.col("gameEvents").struct.field("teamName").alias("team_name"),
-        pl.col("gameEvents").struct.field("homeTeam").alias("home_team_in_possession"),
         pl.col("gameEvents").struct.field("playerId").alias("player_id"),
         pl.col("gameEvents").struct.field("playerName").alias("player_name"),
         pl.col("possessionEvents").struct.field("possessionEventType").alias("possession_event_type"),
-        pl.col("possessionEvents").struct.field("gameClock").alias("game_clock"),
     ]).with_columns(
         (pl.col("start_game_clock") // 60).alias("minute"),
     )
@@ -199,13 +197,6 @@ def list_goals(match_id: int | None = None) -> pl.DataFrame:
         pl.col("possessionEvents").struct.field("bodyType").alias("body_part"),
         pl.col("gameEvents").struct.field("setpieceType").alias("setpiece_type"),
         pl.col("gameEvents").struct.field("initialNonEvent").alias("disallowed"),
-        # Outcome-specific por tipo de event (necesario para resolver own-goals
-        # inadvertentes de CR/PA/CL/RE/TC/IT donde shooter_id es null):
-        pl.col("possessionEvents").struct.field("passOutcomeType").alias("pass_outcome"),
-        pl.col("possessionEvents").struct.field("crossOutcomeType").alias("cross_outcome"),
-        pl.col("possessionEvents").struct.field("clearanceOutcomeType").alias("clearance_outcome"),
-        pl.col("possessionEvents").struct.field("reboundOutcomeType").alias("rebound_outcome"),
-        pl.col("possessionEvents").struct.field("touchOutcomeType").alias("touch_outcome"),
     ]).with_columns(
         ((pl.col("period") == 4) & (pl.col("start_game_clock") > 7200)).alias("shootout"),
     )
@@ -216,8 +207,6 @@ def list_goals(match_id: int | None = None) -> pl.DataFrame:
         "keeper_id", "keeper_name",
         "body_part", "setpiece_type",
         "possession_event_type",
-        "pass_outcome", "cross_outcome", "clearance_outcome",
-        "rebound_outcome", "touch_outcome",
         "disallowed", "shootout",
     ]).sort(["match_id", "start_game_clock"]).collect()
 
