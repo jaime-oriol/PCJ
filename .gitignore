@@ -76,5 +76,7 @@ desktop.ini
 logs/
 
 # Artefactos de runtime de los modelos
-cache/                  # cache socceraction (StatsBombLoader)
-catboost_info/          # training info / learn-test errors
+# cache/         -> cache socceraction (StatsBombLoader)
+# catboost_info/ -> training info / learn-test errors
+cache/
+catboost_info/
