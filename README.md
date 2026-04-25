@@ -37,9 +37,11 @@ src/
 │                           #   agnostico al proveedor, usado por M10)
 
 notebooks/
-└── M10_run.ipynb           # entry point M10 a 25 Hz partido a partido (resumable:
+└── M10_run.ipynb           # M10 ejecutado a 25 Hz partido a partido (resumable:
                             # cachea cada partido aparte, retoma tras interrupcion)
 ```
+
+Estado: M01-M10 ejecutados sobre los 64 partidos WC22. M11-M16 pendientes.
 
 Datos, documentacion interna del proyecto y outputs intermedios estan fuera del
 repo (`.gitignore`).
