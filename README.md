@@ -30,7 +30,11 @@ src/
 │                           #   via tracking PFF 25Hz vectorizado polars
 ├── M10_offball.py          # Off-ball: OBSO + C-OBSO (Spearman 2018 + Teranishi 2022)
 │                           #   PPCF Z02 + xG grid + tracking PFF 25Hz full quality
-├── (M11-M16)               # pipeline restante (Pulso Fisico + agregacion final + ranking)
+├── M11_fisico.py           # Pulso Fisico: metricas Bradley 2024 (HSR/sprint/PSV95/
+│                           #   Z1-Z5/HMLD/accel/decel) con Hampel + Butterworth dual
+│                           #   cutoff (1Hz vel, 2Hz acc) + state-space bayesiano de
+│                           #   fatiga (numpyro SVI) -> score_phys = residuo z-score
+├── (M12-M16)               # pipeline restante (DiD + AIPW + CATE + ranking final)
 ├── Z01_vaep.py             # building block atomic-VAEP wrapper (compute_features/labels
 │                           #   + save_models/load_models, usado por M08/M09)
 └── Z02_pitch_control.py    # building block PPCF Spearman 2018 vectorizado (core
@@ -41,7 +45,7 @@ notebooks/
                             # cachea cada partido aparte, retoma tras interrupcion)
 ```
 
-Estado: M01-M10 ejecutados sobre los 64 partidos WC22. M11-M16 pendientes.
+Estado: M01-M11 ejecutados sobre los 64 partidos WC22. M12-M16 pendientes.
 
 Datos, documentacion interna del proyecto y outputs intermedios estan fuera del
 repo (`.gitignore`).
