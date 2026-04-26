@@ -35,18 +35,25 @@ src/
 │                           #   segmentacion teleports + modelo bayesiano jerarquico
 │                           #   multivariate (numpyro SVI 3 RATES) -> score_phys =
 │                           #   residuo z-score del baseline jugador-minuto esperado
-├── (M12-M16)               # pipeline restante (DiD + AIPW + CATE + ranking final)
+├── M12_did.py              # DiD within-player: ATE FE (player_shock + post,
+│                           #   cluster player) + event-study Sun-Abraham 2021
+│                           #   (pyfixest) + BJS imputation (Borusyak-Jaravel-
+│                           #   Spiess 2024, manual) + HonestDiD-style sensitivity
+│                           #   (Rambachan-Roth 2023, M ∈ {0.5, 1, 2}) +
+│                           #   pre-trends F-test sobre 4 canales x 2 shock_types
+├── (M13-M16)               # pipeline restante (AIPW + CATE + ranking final)
 ├── Z01_vaep.py             # building block atomic-VAEP wrapper (compute_features/labels
 │                           #   + save_models/load_models, usado por M08/M09)
 └── Z02_pitch_control.py    # building block PPCF Spearman 2018 vectorizado (core
 │                           #   agnostico al proveedor, usado por M10)
 
 notebooks/
-└── M10_run.ipynb           # M10 ejecutado a 25 Hz partido a partido (resumable:
-                            # cachea cada partido aparte, retoma tras interrupcion)
+└── regen_all.ipynb         # regen completa M03-M12 con flags FORCE/RETRAIN
+                            # por celda; 1 celda independiente por modulo
+                            # para re-ejecucion granular
 ```
 
-Estado: M01-M11 ejecutados sobre los 64 partidos WC22. M12-M16 pendientes.
+Estado: M01-M12 ejecutados sobre los 64 partidos WC22. M13-M16 pendientes.
 
 Datos, documentacion interna del proyecto y outputs intermedios estan fuera del
 repo (`.gitignore`).
@@ -55,4 +62,5 @@ repo (`.gitignore`).
 
 Python (polars, pyarrow, pandas) +
 modelos (catboost, lightgbm, numpyro/jax, scikit-learn) +
-hyperparam tuning (optuna) + acciones (socceraction atomic-VAEP).
+hyperparam tuning (optuna) + acciones (socceraction atomic-VAEP) +
+DiD moderno (pyfixest fixed-effects + Sun-Abraham event-study).
