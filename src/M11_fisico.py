@@ -1,45 +1,57 @@
 """
-M11_fisico - Canal Pulso Fisico via metricas tracking + modelo bayesiano de fatiga.
+M11_fisico - Canal Pulso Fisico via metricas Bradley 2024 SOTA + residual bayesiano.
 
-Fase 2 PCJ, canal 4 de 4. Aisla "lo que el jugador APRIETA" (decision mental) de
-"lo que el jugador PUEDE" (estado fisico) modelando la fatiga acumulada como
-estado latente y reportando el RESIDUO sobre la prediccion fatiga-esperada.
+Fase 2 PCJ, canal 4 de 4. Aisla "lo que el jugador APRIETA" (decision mental)
+de "lo que el jugador PUEDE" (estado fisico) reportando el RESIDUO de tres
+metricas-rate observadas vs lo predicho por:
+  baseline_jugador (capacidad personal) + curva_temporal_minuto (fatiga media).
 
 Pipeline:
-  1. Limpieza tracking + velocidades smoothed (Hampel + Butterworth fase-cero).
-     Segmentacion por discontinuidades fisicas (camera switch / ID swap).
+  1. Limpieza tracking + velocidades smoothed:
+     - Segmentacion por discontinuidades fisicas (camera switch / ID swap).
+     - Butterworth lowpass filtfilt (fase cero, cutoff 1 Hz, Buchheit standard).
+     - Hampel filter sobre velocidad para outliers residuales.
+     - Cap a 11 m/s con re-scale proporcional preservando direccion.
   2. Metricas frame-level agregadas por (player, match, minute) — Bradley 2024:
        - distance_m       : integral vel * dt (m).
-       - hsr_s            : segundos a >= 19.8 km/h (Ju et al. 2022, FIFA reglas).
+       - hsr_s            : segundos a >= 19.8 km/h (Ju et al. 2022).
        - sprint_s         : segundos a >= 25 km/h.
-       - sprint_count     : # eventos sprint distintos (Brad onset >=1s + recovery >=2s).
+       - sprint_count     : # eventos sprint distintos (onset>=1s + recovery>=2s).
        - psv95            : peak speed velocity (p95 robusto del minuto, m/s).
-       - n_high_accel     : segundos con |a| >= 3 m/s² (accel intenso).
-       - n_high_decel     : segundos con a <= -3 m/s² (decel intenso, frenadas).
-       - z1_m..z5_m       : distancia por zona Bradley (km/h):
-                             Z1<7, Z2 7-13, Z3 13-19.8, Z4 19.8-25, Z5>25.
+       - n_high_accel     : segundos con a >= 3 m/s²  (Akenhead 2013).
+       - n_high_decel     : segundos con a <= -3 m/s² (Akenhead 2013).
+       - z1_m..z5_m       : distancia por zona Bradley (Z1<7, Z2 7-13, Z3 13-19.8,
+                             Z4 19.8-25, Z5>25 km/h).
        - hmld_m           : High Metabolic Load Distance, Osgnach et al. 2010
-                             (P_metabolic >= 25.5 W/kg).
-  3. Modelo bayesiano state-space (numpyro SVI):
-       fatiga[t] = (1-alpha) * fatiga[t-1] + load[t]
-       log(metric) ~ alpha_player + beta * fatiga + minute_fe + epsilon
-     score_phys_minute = residual (observado - prediccion fatiga-esperada).
-  4. Agregacion per_shock_window (pre/post +-10min).
+                             (P_metabolic >= 25.5 W/kg, Eq 7-9).
+  3. Modelo bayesiano jerarquico multivariate (numpyro SVI, 3 RATES):
+       log(rate_k[p,m,t]) ~ Normal(
+           mu_player[p,k] + b1[k]*(t/90) + b2[k]*(t/90)^2,
+           sigma_eps[k]
+       )   k in {psv95, mean_speed, hsr_rate}
+       mu_player[p,k] ~ Normal(mu_global[k], sigma_p[k])  random effects player
+     score_phys = mean(z-score residuos sobre 3 targets).
+     NO modelamos fatigue explicita: el baseline mu_player + curva temporal
+     quadratic ya encierra la fatigue media-esperada. El residuo capta
+     "se desvio del baseline esperado para EL en ESE minuto" — exactamente
+     "APRIETA mas/menos de lo esperado". Targets son RATES (independientes de
+     cobertura n_frames del minute), evitando contaminacion por subs / stoppage.
+  4. Agregacion per_shock_window (pre/post +-10min) con score_phys + componentes.
 
 Acceptance (ARCHITECTURE.md + Bradley 2024 WC22):
-  - Distancia top starters ~10-11 km/partido.
-  - PSV95 top players ~32-34 km/h (NO cap saturado).
-  - n_high_accel ~50-100 segundos/jugador-partido.
-  - Residuos centrados en 0 (esperanza condicional 0).
+  - Distancia top starters ~10-12 km/partido.
+  - PSV95 top players ~32-37 km/h (sin cap saturado).
+  - n_high_accel ~50-100 s/jugador-partido, simetrico con n_high_decel.
+  - score_phys mean ~0, std ~0.85 (z-scores correlados con mean(z)).
 
 Output:
   data/parquet/derived/fisico/
     raw_per_minute.parquet      # metricas raw frame-level agregadas.
-    model/fatigue_state.pkl     # SVI fit (parametros posterior).
-    per_minute.parquet          # score_phys (residuo) per (match, player, min).
-    per_shock_window.parquet    # pre/post pm cada shock.
+    model/phys_state.pkl        # SVI fit (parametros posterior).
+    per_minute.parquet          # score_phys (residuo z-score) per (m, p, min).
+    per_shock_window.parquet    # pre/post de cada shock.
 
-Depende de: M01 (tracking, rosters), M03 (player_minutes), M07 (shocks_table).
+Depende de: M01 (tracking, rosters), M07 (shocks_table).
 """
 
 from __future__ import annotations
@@ -59,7 +71,6 @@ if str(_SRC_DIR) not in sys.path:
 from M01_loader_pff import (
     load_metadata, load_rosters, scan_tracking, list_event_match_ids,
 )
-from M03_preprocess import player_minutes
 from M07_shocks import build_shocks_table
 
 
@@ -98,14 +109,12 @@ _TELEPORT_SPEED_THRESHOLD_MPS = 12.0
 _HAMPEL_WINDOW_VEL = 9
 _HAMPEL_NSIGMAS    = 3.0
 
-# Butterworth fase-cero. Dos cutoffs paralelos:
-#  - 1 Hz para velocidad (Buchheit standard, suaviza ruido alto-frecuencia).
-#  - 2 Hz para aceleracion (frenazos reales 0.3-0.5s tienen energia 2-3 Hz, un
-#    cutoff demasiado bajo atenuaria picos de accel/decel reales).
-_BUTTER_ORDER          = 4
-_BUTTER_CUTOFF_VEL_HZ  = 1.0
-_BUTTER_CUTOFF_ACC_HZ  = 2.0
-_FPS_DEFAULT           = 25.0
+# Butterworth fase-cero, cutoff 1 Hz (Buchheit standard biomecanica deportiva).
+# Suaviza ruido alto-frecuencia preservando dinamica de movimiento real (gestos
+# > ~1s). Aceleracion tangencial signed_accel se deriva del speed smoothed.
+_BUTTER_ORDER     = 4
+_BUTTER_CUTOFF_HZ = 1.0
+_FPS_DEFAULT      = 25.0
 
 # Min frames para procesar un segmento. filtfilt default padlen = 3*max(len(a),len(b))
 # con order=4 -> padlen=15. Necesitamos len(signal) > 15 -> minimo 16.
@@ -117,7 +126,7 @@ _MIN_SEGMENT_FRAMES = 16
 # ===========================================================================
 
 def _butter_lowpass_filtfilt(signal: np.ndarray, fs: float = _FPS_DEFAULT,
-                              cutoff: float = _BUTTER_CUTOFF_VEL_HZ,
+                              cutoff: float = _BUTTER_CUTOFF_HZ,
                               order: int = _BUTTER_ORDER) -> np.ndarray:
     """Butterworth lowpass + filtfilt (fase cero, sin lag)."""
     if len(signal) < _MIN_SEGMENT_FRAMES:
@@ -166,53 +175,45 @@ def _segment_by_teleports(px: np.ndarray, py: np.ndarray, dt: float,
 
 def _process_segment(px_seg: np.ndarray, py_seg: np.ndarray,
                       fs: float) -> tuple[np.ndarray, np.ndarray, np.ndarray,
-                                          np.ndarray, np.ndarray]:
-    """Procesa 1 segmento contiguo de posiciones, dual pipeline (vel 1Hz, acc 2Hz).
+                                          np.ndarray]:
+    """Procesa 1 segmento contiguo de posiciones.
 
-    Pipeline ELITE:
-      1. Pipeline VEL (cutoff 1Hz): Butterworth lowpass sobre positions ->
-         gradient -> vx, vy, speed. Cutoff 1Hz es Buchheit standard.
-         Hampel filter sobre speed limpia outliers residuales.
-      2. Pipeline ACC (cutoff 2Hz): Butterworth sobre positions con cutoff
-         mas alto para preservar frenazos cortos (0.3-0.5s, energia ~2-3Hz);
-         doble gradient -> ax, ay, |a|.
-      3. Aceleracion tangencial (signed): gradient de speed (pipeline vel)
-         para coherencia con HSR/sprint thresholds.
-      4. Cap final sobre speed con re-scale proporcional a vx/vy.
+    Pipeline (todo cutoff 1Hz, Buchheit standard):
+      1. Butterworth lowpass filtfilt (fase cero) sobre px, py.
+      2. np.gradient / dt -> vx, vy, speed.
+      3. Hampel filter sobre speed: limpia outliers residuales en bordes
+         de segmento (gradient artifacts).
+      4. signed_accel = gradient(speed, dt): aceleracion tangencial signed
+         (positive = acelera, negative = frena). Coherente con threshold
+         HSR/sprint sobre la misma speed smoothed.
+      5. Cap final sobre speed con re-scale proporcional a vx/vy
+         (preserva direccion).
 
-    Hampel se aplica sobre VELOCIDAD (no posiciones) para no destruir dinamica
-    de aceleracion cerca de teleports — la segmentacion previa ya elimina
-    discontinuidades fisicas.
+    La segmentacion previa por teleports elimina discontinuidades fisicas,
+    asi que Hampel(speed) ataca solo gradient artifacts residuales.
 
     Returns:
-        (vx, vy, speed, signed_accel, accel_mod), todos shape (n,).
+        (vx, vy, speed, signed_accel), todos shape (n,) en m/s y m/s².
     """
     n = len(px_seg)
     if n < _MIN_SEGMENT_FRAMES:
-        return (np.zeros(n),) * 5
+        return (np.zeros(n),) * 4
     dt = 1.0 / fs
 
-    # 1. Pipeline VEL (cutoff 1Hz)
-    px_v = _butter_lowpass_filtfilt(px_seg, fs, _BUTTER_CUTOFF_VEL_HZ)
-    py_v = _butter_lowpass_filtfilt(py_seg, fs, _BUTTER_CUTOFF_VEL_HZ)
+    # 1-2. Butterworth + gradient
+    px_v = _butter_lowpass_filtfilt(px_seg, fs)
+    py_v = _butter_lowpass_filtfilt(py_seg, fs)
     vx = np.gradient(px_v, dt)
     vy = np.gradient(py_v, dt)
     speed = np.sqrt(vx ** 2 + vy ** 2)
+
+    # 3. Hampel sobre speed (outliers residuales)
     speed = _hampel_filter(speed)
 
-    # 2. Pipeline ACC (cutoff 2Hz)
-    px_a = _butter_lowpass_filtfilt(px_seg, fs, _BUTTER_CUTOFF_ACC_HZ)
-    py_a = _butter_lowpass_filtfilt(py_seg, fs, _BUTTER_CUTOFF_ACC_HZ)
-    vx_a = np.gradient(px_a, dt)
-    vy_a = np.gradient(py_a, dt)
-    ax = np.gradient(vx_a, dt)
-    ay = np.gradient(vy_a, dt)
-    accel_mod = np.sqrt(ax ** 2 + ay ** 2)
-
-    # 3. Signed accel tangencial (sobre speed pipeline VEL)
+    # 4. Signed accel tangencial
     signed_accel = np.gradient(speed, dt)
 
-    # 4. Cap final con re-scale proporcional
+    # 5. Cap final con re-scale proporcional
     cap_mask = speed > MAX_HUMAN_SPEED_MPS
     if cap_mask.any():
         scale = MAX_HUMAN_SPEED_MPS / speed[cap_mask]
@@ -220,41 +221,39 @@ def _process_segment(px_seg: np.ndarray, py_seg: np.ndarray,
         vy[cap_mask] *= scale
         speed[cap_mask] = MAX_HUMAN_SPEED_MPS
 
-    return vx, vy, speed, signed_accel, accel_mod
+    return vx, vy, speed, signed_accel
 
 
 def _compute_velocities_clean(positions_x: np.ndarray, positions_y: np.ndarray,
                                fs: float = _FPS_DEFAULT
                                ) -> tuple[np.ndarray, np.ndarray, np.ndarray,
-                                          np.ndarray, np.ndarray]:
-    """Pipeline ELITE: posiciones -> (vx, vy, speed, signed_accel, accel_mod).
+                                          np.ndarray]:
+    """Pipeline ELITE: posiciones -> (vx, vy, speed, signed_accel).
 
     Segmenta por teleports y procesa cada segmento independientemente con
-    `_process_segment` (dual cutoff 1Hz vel / 2Hz acc).
+    `_process_segment` (Butterworth filtfilt + Hampel + cap proporcional).
     """
     n = len(positions_x)
     vx = np.zeros(n)
     vy = np.zeros(n)
     speed = np.zeros(n)
     signed_a = np.zeros(n)
-    accel_m = np.zeros(n)
     if n < 2:
-        return vx, vy, speed, signed_a, accel_m
+        return vx, vy, speed, signed_a
 
     dt = 1.0 / fs
     for (s, e) in _segment_by_teleports(positions_x, positions_y, dt):
         if e - s < _MIN_SEGMENT_FRAMES:
             continue
-        seg_vx, seg_vy, seg_sp, seg_sa, seg_am = _process_segment(
+        seg_vx, seg_vy, seg_sp, seg_sa = _process_segment(
             positions_x[s:e], positions_y[s:e], fs,
         )
-        vx[s:e]      = seg_vx
-        vy[s:e]      = seg_vy
-        speed[s:e]   = seg_sp
+        vx[s:e]       = seg_vx
+        vy[s:e]       = seg_vy
+        speed[s:e]    = seg_sp
         signed_a[s:e] = seg_sa
-        accel_m[s:e]  = seg_am
 
-    return vx, vy, speed, signed_a, accel_m
+    return vx, vy, speed, signed_a
 
 
 def _metabolic_power(speed: np.ndarray, signed_accel: np.ndarray) -> np.ndarray:
@@ -314,8 +313,14 @@ def _count_sprint_events(speed: np.ndarray, fs: float = _FPS_DEFAULT) -> int:
 #  SECCION 2 — Metricas fisicas per (player, minute)
 # ===========================================================================
 
+# Offsets para convertir (period, minute) <-> seconds-since-match-start.
+# Coinciden con la convencion PFF/SB: period 1 [0, 45min), 2 [45, 90),
+# 3 ET1 [90, 105), 4 ET2 [105, 120).
+PERIOD_OFFSET_MIN = {1: 0, 2: 45, 3: 90, 4: 105}
+
 _PHYS_SCHEMA = {
-    "pff_match_id":  pl.Int64, "player_id": pl.Int64, "minute": pl.Int64,
+    "pff_match_id":  pl.Int64, "player_id": pl.Int64,
+    "period":        pl.Int64, "minute":    pl.Int64,
     "distance_m":    pl.Float64,
     "hsr_s":         pl.Float64,
     "sprint_s":      pl.Float64,
@@ -331,7 +336,7 @@ _PHYS_SCHEMA = {
 
 
 def _aggregate_minute_metrics(speed: np.ndarray, signed_accel: np.ndarray,
-                               accel_mod: np.ndarray, p_metabolic: np.ndarray,
+                               p_metabolic: np.ndarray,
                                minutes: np.ndarray, dt: float) -> list[dict]:
     """Agrega metricas frame-level por minute. Devuelve lista de dicts."""
     rows = []
@@ -341,7 +346,6 @@ def _aggregate_minute_metrics(speed: np.ndarray, signed_accel: np.ndarray,
             continue
         sp = speed[mask]
         sa = signed_accel[mask]
-        am = accel_mod[mask]
         pm = p_metabolic[mask]
 
         distance = float(sp.sum() * dt)
@@ -444,37 +448,32 @@ def _phys_metrics_per_minute(match_id: int) -> pl.DataFrame:
         if group.height < _MIN_SEGMENT_FRAMES:
             continue
         pid = int(player_id)
+        per = int(period)
 
         x = group["x"].to_numpy()
         y = group["y"].to_numpy()
         fn = group["frameNum"].to_numpy()
-        vx, vy, speed, signed_a, accel_mod = _compute_velocities_clean(x, y, fs)
+        vx, vy, speed, signed_a = _compute_velocities_clean(x, y, fs)
         p_meta = _metabolic_power(speed, signed_a)
 
-        minutes = (fn // frames_per_min).astype(np.int64)
-        for r in _aggregate_minute_metrics(speed, signed_a, accel_mod,
-                                            p_meta, minutes, dt):
+        # frameNum es absolute (no se resetea entre periods) -> reconstruir
+        # minute desde el inicio del period (frame_period_start = min frameNum
+        # del grupo). Asi minute es period-relative, comparable con M07
+        # window_pre_start / window_post_end (que estan en period-relative seconds).
+        period_start = fn.min()
+        minutes_in_period = ((fn - period_start) // frames_per_min).astype(np.int64)
+        for r in _aggregate_minute_metrics(speed, signed_a,
+                                            p_meta, minutes_in_period, dt):
             r["pff_match_id"] = match_id
             r["player_id"]    = pid
+            r["period"]       = per
             rows_out.append(r)
 
     if not rows_out:
         return pl.DataFrame(schema=_PHYS_SCHEMA)
     out = pl.DataFrame(rows_out, schema_overrides=_PHYS_SCHEMA)
-    # Si un (player, minute) aparece en >1 period (caso raro stoppage), sumar.
-    return out.group_by(["pff_match_id", "player_id", "minute"]).agg([
-        pl.col("distance_m").sum(),
-        pl.col("hsr_s").sum(),
-        pl.col("sprint_s").sum(),
-        pl.col("sprint_count").sum(),
-        pl.col("psv95").max(),
-        pl.col("n_high_accel").sum(),
-        pl.col("n_high_decel").sum(),
-        pl.col("z1_m").sum(), pl.col("z2_m").sum(), pl.col("z3_m").sum(),
-        pl.col("z4_m").sum(), pl.col("z5_m").sum(),
-        pl.col("hmld_m").sum(),
-        pl.col("n_frames").sum(),
-    ]).sort(["pff_match_id", "player_id", "minute"])
+    # (player, period, minute) ya es unique por construccion.
+    return out.sort(["pff_match_id", "player_id", "period", "minute"])
 
 
 def build_raw_per_minute(cache: bool = True, overwrite: bool = False) -> pl.DataFrame:
@@ -503,113 +502,100 @@ def build_raw_per_minute(cache: bool = True, overwrite: bool = False) -> pl.Data
 
 
 # ===========================================================================
-#  SECCION 3 — Modelo bayesiano state-space de fatiga (numpyro SVI)
+#  SECCION 3 — Modelo bayesiano jerarquico multivariate (numpyro SVI)
 # ===========================================================================
 #
-#  Idea: aislar "lo que el jugador APRIETA" (decision mental) del "puedo"
-#  fisico modelando la fatiga acumulada y reportando el RESIDUO del log(psv95)
-#  observado vs lo esperado dada la fatiga.
+#  Diseño causal honesto: NO modelamos fatigue explicitamente. La razon es
+#  que cualquier proxy minute-level de fatigue (e.g., HMLD acumulada) esta
+#  altamente correlado con la actividad reciente del propio jugador, que
+#  a su vez esta autocorrelada con la actividad actual. Eso hace que
+#  beta_fat capture autocorrelacion, no causalidad fatigue->rendimiento.
 #
-#  Pipeline:
-#    1. Carga deterministica: load[p,m,t] = combinacion lineal estandarizada
-#       de (distance, HSR, sprint, accel, decel) en el minuto t. Carga = "input
-#       fisico" del jugador en ese minuto.
-#    2. Estado latente fatiga: fatiga[p,m,t] = (1-alpha)*fatiga[p,m,t-1] + load.
-#       Fatiga se acumula con la carga y decae linealmente. Reset a 0 al
-#       inicio de cada partido (recovery completa entre matches).
-#    3. Modelo bayesiano numpyro SVI:
-#         log(psv95[p,m,t]) = mu_player[p] + beta_min*(minute/90)
-#                              + beta_fat*fatiga + epsilon
-#       Random effects por player (mu_player ~ Normal(mu_global, sigma_p)).
-#       Coeficiente beta_fat NEGATIVO esperado: a mas fatiga, menor PSV95.
-#    4. score_phys = (log(psv95) - log(psv95_predicho)) / sigma_eps.
-#       Z-score del residuo. Positivo = "aprieta mas de lo esperado dado su
-#       estado fisico". Negativo = "rinde por debajo de su capacidad".
+#  En lugar de eso, modelamos el rendimiento fisico como funcion de:
+#      mu_player[p, k]               (random effect: capacidad personal del
+#                                     jugador en target k)
+#      b1[k] * (t/90) + b2[k] * (t/90)^2   (curva temporal del partido,
+#                                     captura U-shape: warm-up + decline)
+#  El RESIDUAL del modelo es exactamente lo que el TFM busca: "se desvio
+#  del rendimiento esperado para EL en ESE momento del partido". Esto
+#  encierra implicitamente la fatigue media-esperada (via curva temporal)
+#  + capacidad personal (via mu_player). Los desvios son interpretables
+#  causalmente como "APRIETA mas / menos de lo esperado".
+#
+#  Modelo:
+#      log(rate_k[p,m,t]) ~ Normal(
+#          mu_player[p,k] + b1[k]*(t/90) + b2[k]*(t/90)^2,
+#          sigma_eps[k]
+#      )
+#      mu_player[p,k] ~ Normal(mu_global[k], sigma_p[k])
+#      b1[k], b2[k] ~ Normal(0, 0.5)
+#      sigma_p[k], sigma_eps[k] ~ HalfNormal(0.5)
+#
+#  Targets (RATES, independientes de cobertura n_frames del minute):
+#      psv95         (m/s)  : peak speed velocity p95 robusto.
+#      mean_speed    (m/s)  : distance_m / (n_frames * dt).
+#      hsr_rate     [0,1]   : hsr_s / (n_frames * dt). Fraccion del minute
+#                              en HSR (>=19.8 km/h).
+#  Log-transformados: log(psv95), log(mean_speed), log(hsr_rate + 0.01).
+#
+#  score_phys = mean(z-score residuos sobre 3 targets).
 
-_FAT_DECAY_ALPHA = 0.05   # recovery rate por minuto (half-life ~14 min)
-
-# Pesos para combinar metricas en una "carga" single-scalar (estandarizada
-# despues por z-score). Reflejan contribucion energetica relativa:
-#   distance (m): base, peso 1
-#   HSR (s):     mas costoso que jogging, peso 5
-#   sprint (s):  alta intensidad anaerobica, peso 10
-#   accel/decel (s): coste mecanico explosivo, peso 3 cada uno
-_LOAD_WEIGHTS = {
-    "distance_m":   1.0,
-    "hsr_s":        5.0,
-    "sprint_s":    10.0,
-    "n_high_accel": 3.0,
-    "n_high_decel": 3.0,
-}
+_TARGETS = ["log_psv95", "log_mean_speed", "log_hsr_rate"]
+_N_TARGETS = len(_TARGETS)
+_HSR_RATE_FLOOR = 0.01    # evita log(0) cuando hsr_rate=0
 
 
-def _compute_load_and_fatigue(raw: pl.DataFrame,
-                                alpha: float = _FAT_DECAY_ALPHA) -> pl.DataFrame:
-    """Anade cols load_z + fatigue al DataFrame raw_per_minute.
+def _add_rates(raw: pl.DataFrame, fps: float = _FPS_DEFAULT) -> pl.DataFrame:
+    """Anade cols mean_speed (m/s), hsr_rate ([0,1]) — RATES, no integrales.
 
-    load = z-score por jugador-torneo de la suma ponderada (Σ peso * metric).
-    Estandarizar por jugador hace que load sea comparable across players con
-    diferentes baselines (un GK tiene carga mucho menor que un CF).
-
-    fatigue: estado latente computado deterministicamente por (player, match)
-    con el decay alpha. Reset a 0 al inicio de cada match.
+    distance_m, hsr_s son integrales sobre n_frames. Las RATES son
+    independientes de cobertura del minuto (subs, stoppage, etc).
     """
-    # 1. Carga ponderada (raw)
-    raw = raw.with_columns(
-        sum(pl.col(k) * w for k, w in _LOAD_WEIGHTS.items()).alias("load_raw")
+    return raw.with_columns([
+        (pl.col("distance_m") / (pl.col("n_frames") / fps))
+            .alias("mean_speed_mps"),
+        (pl.col("hsr_s") / (pl.col("n_frames") / fps))
+            .alias("hsr_rate"),
+    ])
+
+
+def _prepare_targets(df: pl.DataFrame
+                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Prepara matriz Y (N, 3) de log(rates) + filtros minimos validos.
+
+    minute_norm convierte (period, minute_in_period) a fraccion de partido
+    en [0, 1.33] usando PERIOD_OFFSET_MIN: minute_match = offset + minute,
+    minute_norm = minute_match / 90.
+
+    Filtro laxo `n_frames >= 200` (8s): suficiente para rates estables sin
+    perder muchos minutos validos (subs, stoppage).
+
+    Returns: (y, minute_norm, player_ids).
+    """
+    df_clean = df.filter(
+        (pl.col("psv95") > 0.5) &
+        (pl.col("mean_speed_mps") > 0.1) &      # > 0.36 km/h promedio (no estatico)
+        (pl.col("n_frames") >= 200)              # >=8s cobertura
     )
-    # 2. Z-score per player (mean/std globales del torneo por jugador)
-    stats = raw.group_by("player_id").agg([
-        pl.col("load_raw").mean().alias("load_mean"),
-        pl.col("load_raw").std().fill_null(1.0).alias("load_std"),
-    ]).with_columns(
-        pl.when(pl.col("load_std") < 1e-6).then(1.0)
-          .otherwise(pl.col("load_std")).alias("load_std")
-    )
-    raw = raw.join(stats, on="player_id", how="left").with_columns(
-        ((pl.col("load_raw") - pl.col("load_mean")) / pl.col("load_std"))
-        .alias("load_z")
-    ).drop(["load_raw", "load_mean", "load_std"])
-    # 3. Fatigue deterministico por (player, match) — loop O(N) en numpy
-    #    porque depende secuencialmente del minuto anterior.
-    raw_sorted = raw.sort(["pff_match_id", "player_id", "minute"])
-    pmid = raw_sorted["pff_match_id"].to_numpy()
-    pid  = raw_sorted["player_id"].to_numpy()
-    mins = raw_sorted["minute"].to_numpy()
-    load_z = raw_sorted["load_z"].to_numpy()
-
-    fat = np.zeros(len(load_z))
-    last_key = (None, None)
-    f_prev = 0.0
-    last_min = -1
-    for i in range(len(load_z)):
-        key = (pmid[i], pid[i])
-        if key != last_key:
-            f_prev = 0.0
-            last_min = -1
-            last_key = key
-        # Decay desde last_min hasta mins[i] (gap-aware)
-        gap = mins[i] - last_min
-        if last_min >= 0 and gap > 1:
-            f_prev = f_prev * ((1 - alpha) ** gap)
-        f_curr = (1 - alpha) * f_prev + load_z[i]
-        fat[i] = f_curr
-        f_prev = f_curr
-        last_min = mins[i]
-
-    return raw_sorted.with_columns(pl.Series("fatigue", fat))
+    log_psv = np.log(df_clean["psv95"].to_numpy())
+    log_ms  = np.log(df_clean["mean_speed_mps"].to_numpy())
+    log_hsr = np.log(df_clean["hsr_rate"].to_numpy() + _HSR_RATE_FLOOR)
+    y = np.stack([log_psv, log_ms, log_hsr], axis=-1)
+    period = df_clean["period"].to_numpy()
+    minute = df_clean["minute"].to_numpy()
+    offset = np.array([PERIOD_OFFSET_MIN.get(int(p), 0) for p in period])
+    minute_norm = (offset + minute) / 90.0
+    return y, minute_norm, df_clean["player_id"].to_numpy()
 
 
-def fit_fatigue_model(df_with_fatigue: pl.DataFrame,
-                       n_steps: int = 4000, seed: int = 42) -> dict:
-    """Entrena state-space bayesiano numpyro SVI sobre psv95.
+def fit_phys_model(df_with_rates: pl.DataFrame,
+                    n_steps: int = 4000, seed: int = 42) -> dict:
+    """Entrena modelo bayesiano jerarquico multivariate (3 targets).
 
-    Modelo:
-      log(psv95[p,m,t]) ~ Normal(mu_player[p] + beta_min*(min/90)
-                                  + beta_fat*fatigue, sigma_eps)
-      mu_player[p] ~ Normal(mu_global, sigma_player)
+    Modelo limpio sin endogeneidad: solo mu_player + curva temporal del
+    partido. Residual = "desviacion del baseline jugador-minuto esperado".
 
-    Returns dict con SVI params posterior (loc / scale).
+    Returns dict con SVI params posterior + indexer player_id -> idx.
     """
     import jax
     import jax.numpy as jnp
@@ -618,115 +604,155 @@ def fit_fatigue_model(df_with_fatigue: pl.DataFrame,
     from numpyro.infer import SVI, Trace_ELBO
     from numpyro.infer.autoguide import AutoNormal
 
-    # Filtrar filas con psv95 valido y > 0
-    df = df_with_fatigue.filter(
-        pl.col("psv95") > 0.5      # descartar minutos triviales (jugador parado)
-    )
-    if df.height == 0:
-        raise ValueError("sin datos para fit_fatigue_model")
+    y, mn, player_ids = _prepare_targets(df_with_rates)
+    if len(y) == 0:
+        raise ValueError("sin datos validos para fit_phys_model")
 
-    log_psv95 = np.log(df["psv95"].to_numpy())
-    fatigue = df["fatigue"].to_numpy()
-    minute_norm = df["minute"].to_numpy() / 90.0
-    player_ids = df["player_id"].to_numpy()
     uniq_p = np.unique(player_ids)
-    p_to_idx = {p: i for i, p in enumerate(uniq_p)}
-    p_idx = np.array([p_to_idx[p] for p in player_ids], dtype=np.int32)
+    p_to_idx = {int(p): i for i, p in enumerate(uniq_p)}
+    p_idx = np.array([p_to_idx[int(p)] for p in player_ids], dtype=np.int32)
     n_players = len(uniq_p)
 
-    def model(p_idx_, mn_, fat_, y=None):
-        sigma_p = numpyro.sample("sigma_p", dist.HalfNormal(0.5))
-        mu_g = numpyro.sample("mu_global", dist.Normal(2.0, 1.0))
-        mu_p = numpyro.sample("mu_player",
-                              dist.Normal(mu_g, sigma_p).expand([n_players]).to_event(1))
-        beta_min = numpyro.sample("beta_min", dist.Normal(0.0, 0.5))
-        beta_fat = numpyro.sample("beta_fat", dist.Normal(0.0, 0.5))
-        sigma_eps = numpyro.sample("sigma_eps", dist.HalfNormal(0.3))
-        pred = mu_p[p_idx_] + beta_min * mn_ + beta_fat * fat_
+    # Priors mu_global ~ escala observada (rates en m/s y fraction)
+    #   psv95 ~ 6 m/s  -> log ~ 1.8
+    #   mean_speed ~ 2 m/s -> log ~ 0.7
+    #   hsr_rate ~ 0.02 (2% del minuto) -> log(0.02 + 0.01) ~ -3.5
+    mu_g_prior = jnp.array([
+        float(np.log(np.exp(np.mean(y[:, 0])))),
+        float(np.log(np.exp(np.mean(y[:, 1])))),
+        float(np.log(np.exp(np.mean(y[:, 2])))),
+    ])  # robusto: usa el log-mean observado
+
+    def model(p_idx_, mn_, y_=None):
+        sigma_p = numpyro.sample(
+            "sigma_p", dist.HalfNormal(0.5).expand([_N_TARGETS]).to_event(1)
+        )
+        mu_g = numpyro.sample(
+            "mu_global", dist.Normal(mu_g_prior, 1.0).to_event(1)
+        )
+        mu_p = numpyro.sample(
+            "mu_player",
+            dist.Normal(mu_g[None, :], sigma_p[None, :])
+                 .expand([n_players, _N_TARGETS]).to_event(2),
+        )
+        # Quadratic en minute_norm: captura U-shape (warm-up + decline)
+        b1 = numpyro.sample("b1", dist.Normal(0.0, 0.5)
+                                .expand([_N_TARGETS]).to_event(1))
+        b2 = numpyro.sample("b2", dist.Normal(0.0, 0.5)
+                                .expand([_N_TARGETS]).to_event(1))
+        sigma_eps = numpyro.sample(
+            "sigma_eps", dist.HalfNormal(0.5).expand([_N_TARGETS]).to_event(1)
+        )
+
+        mn2 = mn_ ** 2
+        pred = (mu_p[p_idx_]
+                + b1[None, :] * mn_[:, None]
+                + b2[None, :] * mn2[:, None])
         with numpyro.plate("N", len(p_idx_)):
-            numpyro.sample("obs", dist.Normal(pred, sigma_eps), obs=y)
+            numpyro.sample(
+                "obs",
+                dist.Normal(pred, sigma_eps[None, :]).to_event(1),
+                obs=y_,
+            )
 
     guide = AutoNormal(model)
     svi = SVI(model, guide, numpyro.optim.Adam(0.01), Trace_ELBO())
 
-    state = svi.init(jax.random.PRNGKey(seed),
-                      jnp.asarray(p_idx), jnp.asarray(minute_norm),
-                      jnp.asarray(fatigue), jnp.asarray(log_psv95))
+    state = svi.init(
+        jax.random.PRNGKey(seed),
+        jnp.asarray(p_idx), jnp.asarray(mn), jnp.asarray(y),
+    )
     for i in range(n_steps):
         state, loss = svi.update(state, jnp.asarray(p_idx),
-                                  jnp.asarray(minute_norm),
-                                  jnp.asarray(fatigue),
-                                  jnp.asarray(log_psv95))
+                                  jnp.asarray(mn), jnp.asarray(y))
         if i % 500 == 0:
             print(f"  step {i:5d}  elbo_loss={float(loss):.2f}")
     params = svi.get_params(state)
     return {
         "params": params,
         "p_to_idx": p_to_idx,
-        "n_obs": int(df.height),
+        "n_obs": int(len(y)),
         "n_players": n_players,
+        "targets": _TARGETS,
     }
 
 
-def compute_score_phys(df_with_fatigue: pl.DataFrame, fit: dict) -> pl.DataFrame:
-    """Computa score_phys = z-score del residuo log(psv95) - prediccion.
+def compute_score_phys(df_with_rates: pl.DataFrame, fit: dict) -> pl.DataFrame:
+    """Computa score_phys = mean z-score residuos sobre 3 targets.
 
-    Retorna df con cols (pff_match_id, player_id, minute, score_phys, ...).
+    Filtros y transformaciones de target IDENTICOS a los del entrenamiento
+    (`_prepare_targets`) -> evita disparidad train/predict.
+
+    score_phys positivo = APRIETA mas de lo esperado en ese minuto.
     """
     p = fit["params"]
     p_to_idx = fit["p_to_idx"]
 
-    df = df_with_fatigue.filter(pl.col("psv95") > 0.5).with_columns(
+    # Mismo filter que entrenamiento + map player_id -> idx
+    df_full = df_with_rates.filter(
+        (pl.col("psv95") > 0.5) &
+        (pl.col("mean_speed_mps") > 0.1) &
+        (pl.col("n_frames") >= 200)
+    ).with_columns(
         pl.col("player_id").replace_strict(p_to_idx, default=-1).alias("p_idx")
     ).filter(pl.col("p_idx") >= 0)
 
-    if df.height == 0:
+    if df_full.height == 0:
         raise ValueError("sin filas validas para compute_score_phys")
 
-    p_idx = df["p_idx"].to_numpy()
-    mn = df["minute"].to_numpy() / 90.0
-    fat = df["fatigue"].to_numpy()
-    log_obs = np.log(df["psv95"].to_numpy())
+    p_idx = df_full["p_idx"].to_numpy()
+    period = df_full["period"].to_numpy()
+    minute = df_full["minute"].to_numpy()
+    offset = np.array([PERIOD_OFFSET_MIN.get(int(pp), 0) for pp in period])
+    mn = (offset + minute) / 90.0
+    log_psv = np.log(df_full["psv95"].to_numpy())
+    log_ms  = np.log(df_full["mean_speed_mps"].to_numpy())
+    log_hsr = np.log(df_full["hsr_rate"].to_numpy() + _HSR_RATE_FLOOR)
+    y_obs = np.stack([log_psv, log_ms, log_hsr], axis=-1)
 
-    mu_p = np.array(p["mu_player_auto_loc"])
-    beta_min = float(p["beta_min_auto_loc"])
-    beta_fat = float(p["beta_fat_auto_loc"])
-    sigma_eps = float(np.exp(p["sigma_eps_auto_loc"]))   # log-scale -> abs
+    mu_p = np.array(p["mu_player_auto_loc"])           # (n_players, 3)
+    b1 = np.array(p["b1_auto_loc"])                    # (3,)
+    b2 = np.array(p["b2_auto_loc"])                    # (3,)
+    sigma_eps = np.exp(np.array(p["sigma_eps_auto_loc"]))   # (3,)
 
-    pred = mu_p[p_idx] + beta_min * mn + beta_fat * fat
-    residual = log_obs - pred
-    score_phys = residual / sigma_eps   # z-score
+    pred = (mu_p[p_idx]
+            + b1[None, :] * mn[:, None]
+            + b2[None, :] * (mn[:, None] ** 2))
+    residual = y_obs - pred
+    z_per_target = residual / sigma_eps[None, :]
+    score_phys = z_per_target.mean(axis=1)
 
-    return df.with_columns([
-        pl.Series("log_psv95_pred", pred),
-        pl.Series("log_psv95_obs", log_obs),
-        pl.Series("score_phys", score_phys),
+    return df_full.with_columns([
+        pl.Series("z_psv95",     z_per_target[:, 0]),
+        pl.Series("z_meanspd",   z_per_target[:, 1]),
+        pl.Series("z_hsr",       z_per_target[:, 2]),
+        pl.Series("score_phys",  score_phys),
     ]).select([
-        "pff_match_id", "player_id", "minute",
-        "log_psv95_obs", "log_psv95_pred", "score_phys",
-        "fatigue", "load_z",
+        "pff_match_id", "player_id", "period", "minute",
+        "z_psv95", "z_meanspd", "z_hsr", "score_phys",
     ])
 
 
 def cache_score_phys(overwrite: bool = False, n_steps: int = 4000) -> pl.DataFrame:
-    """Pipeline completa: load -> fatigue -> SVI fit -> score_phys per_minute."""
+    """Pipeline completa: rates -> SVI multivariate -> score_phys."""
     import pickle
     cache_path = _DERIVED / "per_minute.parquet"
-    fit_path   = _DERIVED / "model" / "fatigue_state.pkl"
+    fit_path   = _DERIVED / "model" / "phys_state.pkl"
     if cache_path.exists() and fit_path.exists() and not overwrite:
         return pl.read_parquet(cache_path)
 
     raw = build_raw_per_minute(cache=True)
-    df_fat = _compute_load_and_fatigue(raw)
-    print(f"  fitting SVI fatigue model ({df_fat.height:,} obs, {n_steps} steps)...")
-    fit = fit_fatigue_model(df_fat, n_steps=n_steps)
+    df_rates = _add_rates(raw)
+    print(f"  fitting SVI multivariate phys model "
+          f"({df_rates.height:,} obs, {n_steps} steps, 3 targets)...")
+    fit = fit_phys_model(df_rates, n_steps=n_steps)
     fit_path.parent.mkdir(parents=True, exist_ok=True)
     with open(fit_path, "wb") as f:
         pickle.dump({k: (np.array(v) if hasattr(v, "shape") else v)
                      for k, v in fit.items() if k != "params"} |
                     {"params": {k: np.array(v) for k, v in fit["params"].items()}}, f)
 
-    out = compute_score_phys(df_fat, fit)
+    out = compute_score_phys(df_rates, fit)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     out.write_parquet(cache_path, compression="snappy")
     return out
@@ -742,18 +768,22 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
     if cache and cache_path.exists():
         return pl.read_parquet(cache_path)
 
-    pm = cache_score_phys()                                # (pff_match_id, player_id, minute, ...)
+    pm = cache_score_phys()                                # (pff_match_id, player_id, period, minute, ...)
     shocks = build_shocks_table(cache=True, overwrite=False)
 
     pm = pm.rename({"pff_match_id": "match_id"})
 
+    # M07 windows estan en period-relative seconds. M11 minute es period-relative
+    # minute, asi que min_sec = minute * 60. Joineamos por (match_id, player_id,
+    # period) para que el window solo aplique a rows del mismo period del shock.
     shocks_slim = shocks.select([
-        "match_id", "shock_id", "player_id", "shock_type",
+        "match_id", "shock_id", "player_id", "shock_type", "period",
         "window_pre_start", "window_pre_end",
         "window_post_start", "window_post_end",
     ])
 
-    joined = shocks_slim.join(pm, on=["match_id", "player_id"], how="left") \
+    joined = shocks_slim.join(pm, on=["match_id", "player_id", "period"],
+                                how="left") \
                         .with_columns((pl.col("minute") * 60).alias("min_sec"))
 
     pre = joined.filter(
@@ -761,16 +791,18 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         (pl.col("min_sec") < pl.col("window_pre_end"))
     ).group_by(["match_id", "shock_id", "player_id", "shock_type"]).agg([
         pl.col("score_phys").mean().alias("score_phys_pre"),
-        pl.col("fatigue").mean().alias("fatigue_pre"),
-        pl.col("load_z").sum().alias("load_z_pre"),
+        pl.col("z_psv95").mean().alias("z_psv95_pre"),
+        pl.col("z_meanspd").mean().alias("z_meanspd_pre"),
+        pl.col("z_hsr").mean().alias("z_hsr_pre"),
     ])
     post = joined.filter(
         (pl.col("min_sec") >= pl.col("window_post_start")) &
         (pl.col("min_sec") <= pl.col("window_post_end"))
     ).group_by(["match_id", "shock_id", "player_id", "shock_type"]).agg([
         pl.col("score_phys").mean().alias("score_phys_post"),
-        pl.col("fatigue").mean().alias("fatigue_post"),
-        pl.col("load_z").sum().alias("load_z_post"),
+        pl.col("z_psv95").mean().alias("z_psv95_post"),
+        pl.col("z_meanspd").mean().alias("z_meanspd_post"),
+        pl.col("z_hsr").mean().alias("z_hsr_post"),
     ])
 
     base = shocks.select(["match_id", "shock_id", "player_id", "shock_type"]).unique()
@@ -790,7 +822,7 @@ if __name__ == "__main__":
     print("=== M11_fisico ELITE pipeline completo ===\n")
 
     # Paso 1: Metricas raw Bradley 2024 SOTA
-    print("[1] Metricas raw fisicas (Butterworth dual cutoff + segmentacion teleports)")
+    print("[1] Metricas raw fisicas (Butterworth 1Hz + Hampel + segmentacion teleports)")
     t0 = time.time()
     raw = build_raw_per_minute(cache=True, overwrite=False)
     print(f"  raw_per_minute: {raw.height:,} filas en {time.time()-t0:.1f}s")
@@ -836,15 +868,16 @@ if __name__ == "__main__":
         ["player_id","km","hsr_s","sprint_s","n_sprints","peak_kmh","accel_s","decel_s"]
     ))
 
-    # Paso 3-4: Modelo bayesiano fatiga + score_phys + per_shock_window
-    print("\n[3] Modelo bayesiano fatiga state-space + score_phys")
+    # Paso 3-4: Modelo bayesiano residualizado + score_phys + per_shock_window
+    print("\n[3] Modelo bayesiano jerarquico multivariate + score_phys")
     t0 = time.time()
     pm = cache_score_phys(overwrite=True, n_steps=4000)
     print(f"  per_minute: {pm.height:,} filas en {time.time()-t0:.1f}s")
     print(f"  score_phys range: [{pm['score_phys'].min():.3f}, {pm['score_phys'].max():.3f}]")
     print(f"  score_phys mean (esperado ~0): {pm['score_phys'].mean():+.4f}")
     print(f"  score_phys std (esperado ~1):  {pm['score_phys'].std():.4f}")
-    print(f"  fatigue range: [{pm['fatigue'].min():.2f}, {pm['fatigue'].max():.2f}]")
+    print(f"  z_psv95 / z_meanspd / z_hsr means: "
+          f"{pm['z_psv95'].mean():+.4f} / {pm['z_meanspd'].mean():+.4f} / {pm['z_hsr'].mean():+.4f}")
 
     print("\n[4] Aggregate per_shock_window")
     t0 = time.time()
@@ -854,8 +887,12 @@ if __name__ == "__main__":
         pl.col("score_phys_pre").mean().alias("phys_pre"),
         pl.col("score_phys_post").mean().alias("phys_post"),
         (pl.col("score_phys_post") - pl.col("score_phys_pre")).mean().alias("delta_phys"),
-        pl.col("fatigue_pre").mean().alias("fat_pre"),
-        pl.col("fatigue_post").mean().alias("fat_post"),
+        pl.col("z_psv95_pre").mean().alias("psv_pre"),
+        pl.col("z_psv95_post").mean().alias("psv_post"),
+        pl.col("z_meanspd_pre").mean().alias("spd_pre"),
+        pl.col("z_meanspd_post").mean().alias("spd_post"),
+        pl.col("z_hsr_pre").mean().alias("hsr_pre"),
+        pl.col("z_hsr_post").mean().alias("hsr_post"),
     ])
     print("  delta score_phys por shock_type (signo positivo = aprieta tras shock):")
     print(summary)

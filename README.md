@@ -31,9 +31,10 @@ src/
 ├── M10_offball.py          # Off-ball: OBSO + C-OBSO (Spearman 2018 + Teranishi 2022)
 │                           #   PPCF Z02 + xG grid + tracking PFF 25Hz full quality
 ├── M11_fisico.py           # Pulso Fisico: metricas Bradley 2024 (HSR/sprint/PSV95/
-│                           #   Z1-Z5/HMLD/accel/decel) con Hampel + Butterworth dual
-│                           #   cutoff (1Hz vel, 2Hz acc) + state-space bayesiano de
-│                           #   fatiga (numpyro SVI) -> score_phys = residuo z-score
+│                           #   Z1-Z5/HMLD/accel/decel) con Hampel + Butterworth +
+│                           #   segmentacion teleports + modelo bayesiano jerarquico
+│                           #   multivariate (numpyro SVI 3 RATES) -> score_phys =
+│                           #   residuo z-score del baseline jugador-minuto esperado
 ├── (M12-M16)               # pipeline restante (DiD + AIPW + CATE + ranking final)
 ├── Z01_vaep.py             # building block atomic-VAEP wrapper (compute_features/labels
 │                           #   + save_models/load_models, usado por M08/M09)
