@@ -41,7 +41,14 @@ src/
 │                           #   Spiess 2024, manual) + HonestDiD-style sensitivity
 │                           #   (Rambachan-Roth 2023, M ∈ {0.5, 1, 2}) +
 │                           #   pre-trends F-test sobre 4 canales x 2 shock_types
-├── (M13-M16)               # pipeline restante (AIPW + CATE + ranking final)
+├── M13_aipw.py             # AIPW cuasi-experimento near-miss: DoubleMLIRM
+│                           #   (Chernozhukov 2018, LightGBM cross-fit 5-fold by
+│                           #   match) + DML PLR + DR-learner Kennedy 2023 + RDD
+│                           #   local-lineal sobre PSxG (Imbens-Kalyanaraman) +
+│                           #   spec curve Simonsohn 2020 + balance test
+│                           #   Sant'Anna-Song-Xu 2022 + sensitivity Cinelli-
+│                           #   Hazlett 2020 + comparison vs M12 ATE
+├── (M14-M16)               # pipeline restante (CATE + PCJ + report)
 ├── Z01_vaep.py             # building block atomic-VAEP wrapper (compute_features/labels
 │                           #   + save_models/load_models, usado por M08/M09)
 └── Z02_pitch_control.py    # building block PPCF Spearman 2018 vectorizado (core
@@ -53,7 +60,7 @@ notebooks/
                             # para re-ejecucion granular
 ```
 
-Estado: M01-M12 ejecutados sobre los 64 partidos WC22. M13-M16 pendientes.
+Estado: M01-M13 ejecutados sobre los 64 partidos WC22. M14-M16 pendientes.
 
 Datos, documentacion interna del proyecto y outputs intermedios estan fuera del
 repo (`.gitignore`).
@@ -63,4 +70,5 @@ repo (`.gitignore`).
 Python (polars, pyarrow, pandas) +
 modelos (catboost, lightgbm, numpyro/jax, scikit-learn) +
 hyperparam tuning (optuna) + acciones (socceraction atomic-VAEP) +
-DiD moderno (pyfixest fixed-effects + Sun-Abraham event-study).
+DiD moderno (pyfixest fixed-effects + Sun-Abraham event-study) +
+DoubleML cross-fitted (doubleml IRM/PLR para AIPW Chernozhukov 2018).
