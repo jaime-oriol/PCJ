@@ -10,11 +10,17 @@ P(encajar_en_10_acciones) la accion del defensor (formula atomic-VAEP).
 
 Cuatro sub-canales agregados per (match, player, minute):
   1. score_def_minute       : sum(defensive_value) sobre TODAS las acciones on-ball.
-  2. vdep_minute            : sum(defensive_value) FILTRADO a acciones defensivas
+  2. vdep_like_minute       : sum(defensive_value) FILTRADO a acciones defensivas
                               (tackle, interception, clearance, foul, keeper_*).
-                              Equivalente a VDEP (Toda 2022 PLOS ONE) sin entrenar
-                              modelo separado - misma cabeza p(concedes)
-                              condicionada a acciones defensivas.
+                              **VDEP-LIKE, no VDEP stricto.** Toda et al. 2022
+                              (PLOS ONE) entrena una cabeza dedicada
+                              P(recovery) − C·P(attacked) con XGBoost; aqui
+                              reusamos la cabeza P(concedes) de atomic-VAEP M08
+                              condicionada al subset de acciones defensivas.
+                              Equivalente bajo mismo horizonte (10 acciones) y
+                              corpus, pero NO es VDEP fiel a la spec original.
+                              Renombrado de `vdep_minute` -> `vdep_like_minute`
+                              para no afirmar el metodo Toda explicitamente.
   3. def_third_pct          : fraccion de frames en el tercio defensivo propio
                               durante posesion rival (bloque bajo).
   4. press_intensity_frames : # frames-jugador a <= 3 m del balon durante posesion
@@ -57,7 +63,9 @@ if str(_SRC_DIR) not in sys.path:
 from M01_loader_pff import (
     load_rosters, load_metadata, scan_tracking, list_event_match_ids,
 )
-from M03_preprocess import attacking_direction, _pff_to_sb_match_id
+from M03_preprocess import (
+    attacking_direction, pff_to_sb_match_id, sb_to_pff_match_id,
+)
 from M07_shocks import build_shocks_table
 import M08_ataque as atk
 
@@ -265,56 +273,78 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
         "player_id", "type_name", "defensive_value", "vaep_value",
     ]])
     df = df.with_columns([
-        (pl.col("time_seconds") // 60
-         + (pl.col("period_id") - 1) * 45).cast(pl.Int64).alias("minute"),
+        (pl.col("time_seconds") // 60).cast(pl.Int64).alias("minute_in_period"),
+        ((pl.col("period_id") - 1) * 45 * 60
+         + pl.col("time_seconds")).cast(pl.Int64).alias("sec_abs"),
         pl.col("type_name").is_in(list(_DEF_ACTION_TYPES)).alias("is_def_action"),
     ]).filter(pl.col("player_id").is_not_null())
 
-    # vdep_contrib = defensive_value solo en acciones defensivas (VDEP puro Toda 2022)
+    # vdep_contrib: defensive_value condicionado a acciones defensivas. Reusa
+    # la cabeza P(concedes) de M08 atomic-VAEP — NO es VDEP de Toda 2022 stricto
+    # (que entrena cabeza P(recovery) − C·P(attacked) separada). Equivalente
+    # bajo mismo horizonte y corpus; renombrar como "vdep_like" mas honesto.
     df = df.with_columns(
         pl.when(pl.col("is_def_action")).then(pl.col("defensive_value"))
           .otherwise(0.0).alias("vdep_contrib")
     )
 
-    agg = df.group_by(["game_id", "player_id", "minute"]).agg([
+    agg = df.group_by(
+        ["game_id", "period_id", "player_id", "minute_in_period"],
+    ).agg([
         pl.col("defensive_value").sum().alias("score_def_minute"),
-        pl.col("vdep_contrib").sum().alias("vdep_minute"),
+        pl.col("vdep_contrib").sum().alias("vdep_like_minute"),
+        pl.col("sec_abs").min().alias("sec_abs"),
         pl.col("is_def_action").sum().cast(pl.Int64).alias("n_def_actions"),
         pl.len().cast(pl.Int64).alias("n_actions_total"),
-    ]).rename({"game_id": "sb_match_id", "player_id": "sb_player_id"})
+    ]).rename({
+        "game_id":   "sb_match_id",
+        "player_id": "sb_player_id",
+        "period_id": "period",
+    })
 
-    # Join con CONTEXTO off-ball (def_third_pct via tracking PFF).
-    # Necesita mapeo sb_player_id -> pff_player_id y sb_match_id -> pff_match_id.
-    sb2pff = {v: k for k, v in _pff_to_sb_match_id().items()}
+    # Mapping ids via APIs publicas (X1+X2)
+    sb2pff = sb_to_pff_match_id()
     player_map = atk.build_sb_to_pff_player_map(cache=True).select([
-        "sb_player_id", "pff_player_id",
-    ]).with_columns([
         pl.col("sb_player_id").cast(pl.Int64),
         pl.col("pff_player_id").cast(pl.Int64, strict=False),
     ])
 
     agg = agg.with_columns([
+        pl.col("sb_match_id").cast(pl.Int64),
         pl.col("sb_player_id").cast(pl.Int64),
         pl.col("sb_match_id").replace_strict(sb2pff, default=None).alias("pff_match_id"),
     ]).join(player_map, on="sb_player_id", how="left")
 
     def_ctx = build_def_third_all(cache=True)
     if def_ctx.height > 0:
+        # def_ctx publica `minute` period-relative -> renombrar a minute_in_period
+        # para alinear con el schema X3 estandarizado.
         def_ctx_cast = def_ctx.with_columns([
             pl.col("pff_match_id").cast(pl.Int64),
             pl.col("player_id").cast(pl.Int64).alias("pff_player_id"),
-            pl.col("minute").cast(pl.Int64),
-        ]).select(["pff_match_id", "pff_player_id", "minute",
+            pl.col("minute").cast(pl.Int64).alias("minute_in_period"),
+        ]).select(["pff_match_id", "pff_player_id", "minute_in_period",
                    "def_third_pct", "press_intensity_frames",
                    "oppo_possession_frames"])
         agg = agg.join(def_ctx_cast,
-                        on=["pff_match_id", "pff_player_id", "minute"], how="left")
+                        on=["pff_match_id", "pff_player_id", "minute_in_period"],
+                        how="left")
     else:
         agg = agg.with_columns([
             pl.lit(None, dtype=pl.Float64).alias("def_third_pct"),
             pl.lit(None, dtype=pl.Int64).alias("press_intensity_frames"),
             pl.lit(None, dtype=pl.Int64).alias("oppo_possession_frames"),
         ])
+
+    # Schema canonico (X3): ids -> tiempo -> metricas -> contexto off-ball
+    agg = agg.select([
+        "pff_match_id", "sb_match_id",
+        "pff_player_id", "sb_player_id",
+        "period", "minute_in_period", "sec_abs",
+        "score_def_minute", "vdep_like_minute",
+        "n_def_actions", "n_actions_total",
+        "def_third_pct", "press_intensity_frames", "oppo_possession_frames",
+    ])
 
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,75 +357,102 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
 # ===========================================================================
 
 def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
-    """Por cada (shock, player), suma score_def y n_def_actions en pre/post."""
+    """Por cada (shock, player), suma score_def y n_def_actions en pre/post.
+
+    Schema (X3): pff_match_id + sb_match_id + pff_player_id + sb_player_id.
+    Filtra por sec_abs real (no minute*60 sintetico). vdep_like_minute en
+    lugar de vdep_minute para honestidad semantica (no es VDEP de Toda 2022
+    stricto, ver docstring de modulo).
+    """
     cache_path = _DERIVED / "per_shock_window.parquet"
     if cache and cache_path.exists():
         return pl.read_parquet(cache_path)
 
-    per_min = aggregate_per_player_minute(cache=True)
-    player_map = atk.build_sb_to_pff_player_map(cache=True)
+    per_min = aggregate_per_player_minute(cache=True).rename(
+        {"pff_match_id": "match_id"}
+    ).filter(pl.col("pff_player_id").is_not_null())
+
     shocks = build_shocks_table(cache=True, overwrite=False)
-
-    # Map sb_match_id -> pff_match_id
-    sb2pff = {v: k for k, v in _pff_to_sb_match_id().items()}
-
-    per_min = per_min.with_columns([
-        pl.col("sb_match_id").replace_strict(sb2pff, default=None).alias("match_id"),
-        pl.col("sb_player_id").cast(pl.Int64),
-    ]).filter(pl.col("match_id").is_not_null())
-
-    pm_cast = player_map.select(["sb_player_id", "pff_player_id"]).with_columns([
-        pl.col("sb_player_id").cast(pl.Int64),
-        pl.col("pff_player_id").cast(pl.Int64, strict=False),
-    ])
-    per_min = per_min.join(pm_cast, on="sb_player_id", how="left") \
-                      .filter(pl.col("pff_player_id").is_not_null())
-
-    # Join con shocks + filter windows
     shocks_slim = shocks.select([
         "match_id", "shock_id", "player_id", "shock_type",
+        pl.col("period").alias("shock_period"),
         "window_pre_start", "window_pre_end",
         "window_post_start", "window_post_end",
     ]).rename({"player_id": "pff_player_id"})
 
-    joined = shocks_slim.join(per_min, on=["match_id", "pff_player_id"], how="left") \
-                        .with_columns((pl.col("minute") * 60).alias("min_sec"))
+    joined = shocks_slim.join(
+        per_min, on=["match_id", "pff_player_id"], how="left",
+    )
 
+    # period == shock_period evita contaminacion cross-period (PFF sgc usa
+    # convencion period-displayed-clock, ~8% de eventos colisionarian sin filtro).
     pre = joined.filter(
-        (pl.col("min_sec") >= pl.col("window_pre_start")) &
-        (pl.col("min_sec") < pl.col("window_pre_end"))
+        (pl.col("sec_abs") >= pl.col("window_pre_start")) &
+        (pl.col("sec_abs") < pl.col("window_pre_end")) &
+        (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("score_def_minute").sum().alias("score_def_pre"),
-        pl.col("vdep_minute").sum().alias("vdep_pre"),
+        pl.col("vdep_like_minute").sum().alias("vdep_like_pre"),
         pl.col("n_def_actions").sum().cast(pl.Int64).alias("n_def_actions_pre"),
-        pl.col("press_intensity_frames").sum().cast(pl.Int64).alias("press_frames_pre"),
+        pl.col("press_intensity_frames").sum().cast(pl.Int64)
+            .alias("press_frames_pre"),
     ])
     post = joined.filter(
-        (pl.col("min_sec") >= pl.col("window_post_start")) &
-        (pl.col("min_sec") <= pl.col("window_post_end"))
+        (pl.col("sec_abs") >= pl.col("window_post_start")) &
+        (pl.col("sec_abs") <= pl.col("window_post_end")) &
+        (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("score_def_minute").sum().alias("score_def_post"),
-        pl.col("vdep_minute").sum().alias("vdep_post"),
+        pl.col("vdep_like_minute").sum().alias("vdep_like_post"),
         pl.col("n_def_actions").sum().cast(pl.Int64).alias("n_def_actions_post"),
-        pl.col("press_intensity_frames").sum().cast(pl.Int64).alias("press_frames_post"),
+        pl.col("press_intensity_frames").sum().cast(pl.Int64)
+            .alias("press_frames_post"),
     ])
 
     base = shocks.select([
         "match_id", "shock_id", "player_id", "shock_type"
     ]).rename({"player_id": "pff_player_id"}).unique()
 
-    out = base.join(pre,  on=["match_id","shock_id","pff_player_id","shock_type"], how="left") \
-              .join(post, on=["match_id","shock_id","pff_player_id","shock_type"], how="left") \
-              .with_columns([
-                  pl.col("score_def_pre").fill_null(0.0),
-                  pl.col("score_def_post").fill_null(0.0),
-                  pl.col("vdep_pre").fill_null(0.0),
-                  pl.col("vdep_post").fill_null(0.0),
-                  pl.col("n_def_actions_pre").fill_null(0),
-                  pl.col("n_def_actions_post").fill_null(0),
-                  pl.col("press_frames_pre").fill_null(0),
-                  pl.col("press_frames_post").fill_null(0),
-              ])
+    pff_to_sb_pl = atk.build_sb_to_pff_player_map(cache=True).select([
+        pl.col("pff_player_id").cast(pl.Int64, strict=False),
+        pl.col("sb_player_id").cast(pl.Int64),
+    ]).filter(pl.col("pff_player_id").is_not_null()).unique(
+        subset=["pff_player_id"], keep="first",
+    )
+    pff2sb_match = pff_to_sb_match_id()
+
+    out = (
+        base
+        .join(pre,  on=["match_id","shock_id","pff_player_id","shock_type"],
+              how="left")
+        .join(post, on=["match_id","shock_id","pff_player_id","shock_type"],
+              how="left")
+        .with_columns([
+            pl.col("score_def_pre").fill_null(0.0),
+            pl.col("score_def_post").fill_null(0.0),
+            pl.col("vdep_like_pre").fill_null(0.0),
+            pl.col("vdep_like_post").fill_null(0.0),
+            pl.col("n_def_actions_pre").fill_null(0),
+            pl.col("n_def_actions_post").fill_null(0),
+            pl.col("press_frames_pre").fill_null(0),
+            pl.col("press_frames_post").fill_null(0),
+        ])
+        .rename({"match_id": "pff_match_id"})
+        .join(pff_to_sb_pl, on="pff_player_id", how="left")
+        .with_columns(
+            pl.col("pff_match_id").replace_strict(pff2sb_match, default=None)
+                                    .alias("sb_match_id")
+        )
+        .select([
+            "pff_match_id", "sb_match_id",
+            "shock_id", "shock_type",
+            "pff_player_id", "sb_player_id",
+            "score_def_pre", "score_def_post",
+            "vdep_like_pre", "vdep_like_post",
+            "n_def_actions_pre", "n_def_actions_post",
+            "press_frames_pre", "press_frames_post",
+        ])
+    )
 
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,20 +482,14 @@ if __name__ == "__main__":
             print(f"  def_third_pct range: [{ctx_valid['def_third_pct'].min():.3f}, "
                   f"{ctx_valid['def_third_pct'].max():.3f}]")
 
-    # Acceptance: distribucion por rol (CBs + DMs > CFs)
+    # Acceptance: distribucion por rol (CBs + DMs > CFs).
+    # per_min ya trae pff_player_id (schema X3 estandarizado).
     print("\n[2] Acceptance — score_def por rol (CBs/DMs > CFs):")
-    player_map = atk.build_sb_to_pff_player_map(cache=True)
-    pm_cast = per_min.with_columns(pl.col("sb_player_id").cast(pl.Int64))
-    map_cast = player_map.select(["sb_player_id","pff_player_id"]).with_columns([
-        pl.col("sb_player_id").cast(pl.Int64),
-        pl.col("pff_player_id").cast(pl.Int64, strict=False),
-    ])
-    pm_roles = pm_cast.join(map_cast, on="sb_player_id", how="left") \
-                      .filter(pl.col("pff_player_id").is_not_null())
     ro = load_rosters().select(["player_id","position_group"]) \
                        .unique(subset=["player_id"]) \
                        .rename({"player_id": "pff_player_id"})
-    pm_roles = pm_roles.join(ro, on="pff_player_id", how="left")
+    pm_roles = per_min.filter(pl.col("pff_player_id").is_not_null()) \
+                       .join(ro, on="pff_player_id", how="left")
     by_role = pm_roles.group_by("position_group").agg([
         pl.col("score_def_minute").mean().alias("mean_def_per_min"),
         pl.col("n_def_actions").mean().alias("mean_n_def"),

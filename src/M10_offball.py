@@ -292,11 +292,21 @@ def compute_obso_match(match_id: int, xg_grid: np.ndarray,
     rows = []
     frames_per_min = fps * 60
 
+    # frameNum es video-time (continuo, incluye HT break ~15 min). Para
+    # alinear con M07 windows (en PFF sgc = period-displayed game clock),
+    # convertimos a minute_in_period via primer frame de cada period.
+    period_start_frame = {
+        int(p): int(s) for p, s in
+        frames.group_by("period").agg(pl.col("frameNum").min().alias("ps"))
+              .iter_rows(named=False)
+    }
+
     for r in frames.iter_rows(named=True):
         frame_num = int(r["frameNum"])
         period = int(r["period"])
         home_has_ball = bool(r["home_has_ball"])
-        minute = int(frame_num // frames_per_min)
+        minute = int((frame_num - period_start_frame.get(period, 0))
+                      // frames_per_min)
         att_team = home_id if home_has_ball else away_id
         att_players_raw = r["home_players"] if home_has_ball else r["away_players"]
         att_map = home_map if home_has_ball else away_map
@@ -321,7 +331,7 @@ def compute_obso_match(match_id: int, xg_grid: np.ndarray,
         if att_rows.empty:
             continue
         targets = att_rows[["x_tracking", "y_tracking"]].values.astype(np.float64)
-        ball_pos = pc._get_ball_pos(frame_df)
+        ball_pos = pc.get_ball_pos(frame_df)
         if ball_pos is None:
             continue
 
@@ -386,30 +396,45 @@ def compute_obso_match(match_id: int, xg_grid: np.ndarray,
 
             hist.append((frame_num, float(x), float(y)))
             rows.append({
-                "player_id": pid, "minute": minute,
+                "player_id": pid, "period": period,
+                "minute_in_period": minute,
                 "obso": obso, "c_obso": c_obso,
             })
 
     if not rows:
         return pl.DataFrame(schema={
-            "pff_match_id": pl.Int64, "player_id": pl.Int64, "minute": pl.Int64,
+            "pff_match_id": pl.Int64, "pff_player_id": pl.Int64,
+            "period": pl.Int64, "minute_in_period": pl.Int64,
+            "sec_abs": pl.Int64,
             "obso_mean": pl.Float64, "obso_max": pl.Float64,
             "c_obso_mean": pl.Float64, "attacking_frames": pl.Int64,
         })
 
+    # sec_abs en convencion PFF sgc (period-displayed clock):
+    #     sec_abs = PERIOD_OFFSET[period]*60 + minute_in_period * 60
+    # NO se puede usar frame_num/fps directo porque ese es video-time
+    # (continuo, incluye HT break ~15 min). period_start_frame por period
+    # ya se aplico antes para derivar minute_in_period.
+    period_offset_min = {1: 0, 2: 45, 3: 90, 4: 105}
     df = pl.DataFrame(rows, schema={
-        "player_id": pl.Int64, "minute": pl.Int64,
+        "player_id": pl.Int64, "period": pl.Int64,
+        "minute_in_period": pl.Int64,
         "obso": pl.Float64, "c_obso": pl.Float64,
     })
-    agg = df.group_by(["player_id", "minute"]).agg([
+    agg = df.group_by(["player_id", "period", "minute_in_period"]).agg([
         pl.col("obso").mean().alias("obso_mean"),
         pl.col("obso").max().alias("obso_max"),
         pl.col("c_obso").mean().alias("c_obso_mean"),
         pl.len().alias("attacking_frames"),
-    ]).with_columns(
+    ]).with_columns([
         pl.lit(match_id).cast(pl.Int64).alias("pff_match_id"),
-    ).select(["pff_match_id", "player_id", "minute",
-              "obso_mean", "obso_max", "c_obso_mean", "attacking_frames"])
+        ((pl.col("period").replace_strict(period_offset_min, default=0)
+          + pl.col("minute_in_period")) * 60).cast(pl.Int64).alias("sec_abs"),
+    ]).rename({
+        "player_id": "pff_player_id",
+    }).select(["pff_match_id", "pff_player_id",
+               "period", "minute_in_period", "sec_abs",
+               "obso_mean", "obso_max", "c_obso_mean", "attacking_frames"])
     return agg
 
 
@@ -445,32 +470,37 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
 
 
 def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
-    """OBSO + C-OBSO agregados por ventana pre/post de cada shock."""
+    """OBSO + C-OBSO agregados por ventana pre/post de cada shock.
+
+    Schema (X3): pff_match_id + sb_match_id + pff_player_id. Filtra por
+    sec_abs real (no minute*60 sintetico). M10 es PFF-native asi que no
+    hay sb_player_id directamente; se recupera desde el mapping de M08.
+    """
     cache_path = _DERIVED / "per_shock_window.parquet"
     if cache and cache_path.exists():
         return pl.read_parquet(cache_path)
 
-    per_min = aggregate_per_player_minute(cache=True)
+    per_min = aggregate_per_player_minute(cache=True).rename(
+        {"pff_match_id": "match_id"}
+    )
+
     shocks = build_shocks_table(cache=True, overwrite=False)
-
-    per_min = per_min.rename({"player_id": "pff_player_id",
-                                "pff_match_id": "match_id"}).with_columns([
-        pl.col("match_id").cast(pl.Int64),
-        pl.col("pff_player_id").cast(pl.Int64),
-    ])
-
     shocks_slim = shocks.select([
         "match_id", "shock_id", "player_id", "shock_type",
+        pl.col("period").alias("shock_period"),
         "window_pre_start", "window_pre_end",
         "window_post_start", "window_post_end",
     ]).rename({"player_id": "pff_player_id"})
 
-    joined = shocks_slim.join(per_min, on=["match_id", "pff_player_id"], how="left") \
-                        .with_columns((pl.col("minute") * 60).alias("min_sec"))
+    joined = shocks_slim.join(
+        per_min, on=["match_id", "pff_player_id"], how="left",
+    )
 
+    # period == shock_period evita contaminacion cross-period (ver M08 doc)
     pre = joined.filter(
-        (pl.col("min_sec") >= pl.col("window_pre_start")) &
-        (pl.col("min_sec") < pl.col("window_pre_end"))
+        (pl.col("sec_abs") >= pl.col("window_pre_start")) &
+        (pl.col("sec_abs") < pl.col("window_pre_end")) &
+        (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("obso_mean").mean().alias("obso_pre"),
         pl.col("obso_max").max().alias("obso_max_pre"),
@@ -478,8 +508,9 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         pl.col("attacking_frames").sum().alias("att_frames_pre"),
     ])
     post = joined.filter(
-        (pl.col("min_sec") >= pl.col("window_post_start")) &
-        (pl.col("min_sec") <= pl.col("window_post_end"))
+        (pl.col("sec_abs") >= pl.col("window_post_start")) &
+        (pl.col("sec_abs") <= pl.col("window_post_end")) &
+        (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("obso_mean").mean().alias("obso_post"),
         pl.col("obso_max").max().alias("obso_max_post"),
@@ -491,8 +522,39 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         "match_id", "shock_id", "player_id", "shock_type"
     ]).rename({"player_id": "pff_player_id"}).unique()
 
-    out = base.join(pre,  on=["match_id","shock_id","pff_player_id","shock_type"], how="left") \
-              .join(post, on=["match_id","shock_id","pff_player_id","shock_type"], how="left")
+    # sb_match_id + sb_player_id via mappings publicos (X1+X2)
+    from M03_preprocess import pff_to_sb_match_id
+    import M08_ataque as atk
+    pff2sb_match = pff_to_sb_match_id()
+    pff_to_sb_pl = atk.build_sb_to_pff_player_map(cache=True).select([
+        pl.col("pff_player_id").cast(pl.Int64, strict=False),
+        pl.col("sb_player_id").cast(pl.Int64),
+    ]).filter(pl.col("pff_player_id").is_not_null()).unique(
+        subset=["pff_player_id"], keep="first",
+    )
+
+    out = (
+        base
+        .join(pre,  on=["match_id","shock_id","pff_player_id","shock_type"],
+              how="left")
+        .join(post, on=["match_id","shock_id","pff_player_id","shock_type"],
+              how="left")
+        .rename({"match_id": "pff_match_id"})
+        .join(pff_to_sb_pl, on="pff_player_id", how="left")
+        .with_columns(
+            pl.col("pff_match_id").replace_strict(pff2sb_match, default=None)
+                                    .alias("sb_match_id")
+        )
+        .select([
+            "pff_match_id", "sb_match_id",
+            "shock_id", "shock_type",
+            "pff_player_id", "sb_player_id",
+            "obso_pre", "obso_post",
+            "obso_max_pre", "obso_max_post",
+            "c_obso_pre", "c_obso_post",
+            "att_frames_pre", "att_frames_post",
+        ])
+    )
 
     if cache:
         out.write_parquet(cache_path, compression="snappy")
@@ -521,8 +583,10 @@ if __name__ == "__main__":
 
     # [3] Acceptance: W + CF > CB, simetria LW/RW
     print("\n[3] Acceptance — distribucion por rol:")
-    ro = load_rosters().select(["player_id","position_group"]).unique(subset=["player_id"])
-    roles = per_min.join(ro, on="player_id", how="left")
+    ro = load_rosters().select(["player_id","position_group"]) \
+                       .unique(subset=["player_id"]) \
+                       .rename({"player_id": "pff_player_id"})
+    roles = per_min.join(ro, on="pff_player_id", how="left")
     by_role = roles.group_by("position_group").agg([
         pl.col("obso_mean").mean().alias("obso_mean"),
         pl.col("obso_max").mean().alias("obso_max_mean"),

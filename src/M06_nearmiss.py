@@ -19,8 +19,9 @@ Acceptance (ARCHITECTURE.md): distribucion coherente con benchmarks.
   Escalado a 64 partidos: ~120-185 near-miss totales.
 
 Output: data/parquet/derived/nearmiss/nearmiss_table.parquet
-  cols: match_id, event_uuid, period, minute, second, team_id, team_name,
+  cols: sb_match_id, event_uuid, period, minute, second, team_id, team_name,
         shot_outcome, is_goal, xg_baseline, psxg, near_miss_type, margin_info.
+  El consumer (M13 AIPW) recupera pff_match_id via M03.sb_to_pff_match_id().
 
 Depende de: M02 (SB events), M05 (PSxG cache).
 """
@@ -135,7 +136,7 @@ def _detect_glt_denied(psxg: pl.DataFrame) -> pl.DataFrame:
 
 
 _OFFSIDE_SCHEMA = {
-    "match_id": pl.Int64, "event_uuid": pl.String,
+    "sb_match_id": pl.Int64, "event_uuid": pl.String,
     "period": pl.Int64, "minute": pl.Int64, "second": pl.Int64,
     "team_id": pl.Int64, "team_name": pl.String,
     "shot_outcome": pl.String, "is_goal": pl.Boolean,
@@ -208,7 +209,7 @@ def _detect_offside_tight(match_ids: list[int],
                 continue
             team = r.get("team") or {}
             rows.append({
-                "match_id":    int(mid),
+                "sb_match_id": int(mid),
                 "event_uuid":  r.get("id"),
                 "period":      int(r.get("period") or 1),
                 "minute":      int(r.get("minute") or 0),
@@ -252,6 +253,7 @@ def build_near_miss_table(cache: bool = True,
     wc22_mids = list_statsbomb_match_ids(comp_id=43, season_id=106)
 
     # team_id / team_name: extraccion vectorizada via polars (evita loop py).
+    # sb_match_id ya viene del parquet de M05 (rename de _match_id).
     team_dfs = []
     for mid in wc22_mids:
         ev = load_statsbomb_events(mid)
@@ -276,7 +278,7 @@ def build_near_miss_table(cache: bool = True,
     offside  = _detect_offside_tight(wc22_mids)
 
     # Unificar schema
-    cols = ["match_id", "event_uuid", "period", "minute", "second",
+    cols = ["sb_match_id", "event_uuid", "period", "minute", "second",
             "team_id", "team_name", "shot_outcome", "is_goal",
             "xg_baseline", "psxg", "near_miss_type", "margin_info"]
 
@@ -285,7 +287,7 @@ def build_near_miss_table(cache: bool = True,
         # Casts explicitos a los tipos target para que concat no falle
         lits = []
         for c in missing:
-            if c in ("match_id", "period", "minute", "second", "team_id"):
+            if c in ("sb_match_id", "period", "minute", "second", "team_id"):
                 lits.append(pl.lit(None, dtype=pl.Int64).alias(c))
             elif c in ("xg_baseline", "psxg", "margin_info"):
                 lits.append(pl.lit(None, dtype=pl.Float64).alias(c))
@@ -305,7 +307,7 @@ def build_near_miss_table(cache: bool = True,
     # aparecer en (a) y (c) en edge cases raros (Post + PSxG alto). Dedup
     # defensivo para garantia downstream.
     all_nm = all_nm.unique(subset=["event_uuid", "near_miss_type"],
-                            keep="first").sort(["match_id", "minute", "second"])
+                            keep="first").sort(["sb_match_id", "minute", "second"])
 
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,7 +340,7 @@ if __name__ == "__main__":
         sub = nm.filter(pl.col("near_miss_type") == t).head(5)
         if sub.height == 0: continue
         print(f"\n  -- {t} ({sub.height} muestra de {nm.filter(pl.col('near_miss_type')==t).height} total) --")
-        print(sub.select(["match_id", "minute", "team_name", "shot_outcome",
+        print(sub.select(["sb_match_id", "minute", "team_name", "shot_outcome",
                           "xg_baseline", "psxg", "margin_info"]))
 
     # Check acceptance: distribucion razonable

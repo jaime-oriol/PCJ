@@ -7,7 +7,7 @@ NO replicamos esa logica). Reduce Z01 a:
 
   1. compute_features(actions, atomic=True, ...) -> features dataframe
   2. compute_labels(actions, atomic=True, ...)   -> (y_scores, y_concedes)
-  3. _formula_mod(atomic)                         -> modulo formula (usado en M08
+  3. formula_mod(atomic)                          -> modulo formula (usado en M08
                                                      para `value(actions, p_s, p_c)`)
   4. save_models / load_models                    -> CatBoost .cbm helpers
 
@@ -22,7 +22,7 @@ Uso:
     X = vaep_mod.compute_features(actions, atomic=True, provider="statsbomb_atk")
     y_s, y_c = vaep_mod.compute_labels(actions, atomic=True, provider="statsbomb_atk")
     # ... entrena fuera (M08 usa Optuna+CatBoost) ...
-    values = vaep_mod._formula_mod(atomic=True).value(actions, p_s, p_c)
+    values = vaep_mod.formula_mod(atomic=True).value(actions, p_s, p_c)
     vaep_mod.save_models(model_s, model_c, "model/vaep_atk")
 """
 
@@ -78,7 +78,8 @@ def _feat_mod(atomic: bool):
     return _af if atomic else _vf
 
 
-def _formula_mod(atomic: bool):
+def formula_mod(atomic: bool):
+    """Modulo formula VAEP (atomic o classic). API publica usada por M08."""
     return _afm if atomic else _vfm
 
 

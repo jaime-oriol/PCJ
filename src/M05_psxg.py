@@ -22,7 +22,8 @@ Cache:
   data/parquet/derived/psxg/
     training_shots.parquet        # features + label (para reproducibilidad)
     model/psxg_lgb.pkl            # modelo + calibrador + feature list
-    shots.parquet                 # psxg aplicado a WC22 SB + (fallback) training
+    shots.parquet                 # psxg aplicado a WC22 (col sb_match_id, sin
+                                  #   prefijo equivoco)
 
 Consumer: M06 near-miss (criterio "parada con PSxG >= 0.6" identifica paradas
 decisivas como cuasi-experimento exogeno tipo Gauriot & Page 2019).
@@ -606,7 +607,7 @@ def cache_wc22_psxg(fit: dict, overwrite: bool = False) -> Path:
         pl.col("_sb_xg").alias("xg_baseline"),
         pl.col("_label").alias("is_goal"),
     ]).select([
-        pl.col("_match_id").alias("match_id"),
+        pl.col("_match_id").alias("sb_match_id"),
         pl.col("_event_uuid").alias("event_uuid"),
         pl.col("_period").alias("period"),
         pl.col("_minute").alias("minute"),

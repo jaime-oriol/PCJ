@@ -22,7 +22,10 @@ Calibracion: temperature scaling sobre 48 partidos WC22 fase de grupos
 (NO sobre los 16 KO, que son sagrados para test final).
 
 Output: tabla `data/parquet/derived/wp/per_minute.parquet` con
-(match_id, minute, wp_home, wp_draw, wp_away, leverage, elim_prox).
+(match_id, minute, phase, score_diff, wp_home, wp_draw, wp_away, leverage,
+ elim_prox_home, elim_prox_away). Las dos cols `elim_prox_*` reflejan
+ P(equipo NO clasifica): en grupos via Monte Carlo del grupo (n_sim=1500),
+ en KO via formula analitica (1 - wp_ganar - 0.5*wp_draw).
 
 Depende de M01 (events+metadata PFF), M02 (training Wyscout+StatsBomb), M03
 (goals_timeline PFF para evaluacion).
@@ -994,7 +997,9 @@ def compute_wp_per_minute(match_id: int, fit_result: dict,
 
     Returns:
         DataFrame (match_id, minute 1..120, wp_home, wp_draw, wp_away, leverage,
-        elim_prox, score_diff, phase) con phase in {regulation, extra_time}.
+        elim_prox_home, elim_prox_away, score_diff, phase) con phase in
+        {regulation, extra_time}. Las cols elim_prox_* son P(equipo NO clasifica)
+        — grupos via Monte Carlo del grupo, KO via formula analitica.
     """
     if lam_et_h is None or lam_et_a is None:
         lh, la = et_goal_rate_empirical()

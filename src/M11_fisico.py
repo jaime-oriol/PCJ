@@ -319,19 +319,19 @@ def _count_sprint_events(speed: np.ndarray, fs: float = _FPS_DEFAULT) -> int:
 PERIOD_OFFSET_MIN = {1: 0, 2: 45, 3: 90, 4: 105}
 
 _PHYS_SCHEMA = {
-    "pff_match_id":  pl.Int64, "player_id": pl.Int64,
-    "period":        pl.Int64, "minute":    pl.Int64,
-    "distance_m":    pl.Float64,
-    "hsr_s":         pl.Float64,
-    "sprint_s":      pl.Float64,
-    "sprint_count":  pl.Int64,
-    "psv95":         pl.Float64,
-    "n_high_accel":  pl.Float64,
-    "n_high_decel":  pl.Float64,
-    "z1_m":          pl.Float64, "z2_m": pl.Float64, "z3_m": pl.Float64,
-    "z4_m":          pl.Float64, "z5_m": pl.Float64,
-    "hmld_m":        pl.Float64,
-    "n_frames":      pl.Int64,
+    "pff_match_id":     pl.Int64, "pff_player_id": pl.Int64,
+    "period":           pl.Int64, "minute_in_period": pl.Int64,
+    "distance_m":       pl.Float64,
+    "hsr_s":            pl.Float64,
+    "sprint_s":         pl.Float64,
+    "sprint_count":     pl.Int64,
+    "psv95":            pl.Float64,
+    "n_high_accel":     pl.Float64,
+    "n_high_decel":     pl.Float64,
+    "z1_m":             pl.Float64, "z2_m": pl.Float64, "z3_m": pl.Float64,
+    "z4_m":             pl.Float64, "z5_m": pl.Float64,
+    "hmld_m":           pl.Float64,
+    "n_frames":         pl.Int64,
 }
 
 
@@ -364,18 +364,18 @@ def _aggregate_minute_metrics(speed: np.ndarray, signed_accel: np.ndarray,
         hmld = float(sp[pm >= HMLD_POWER_THRESHOLD_W_KG].sum() * dt)
 
         rows.append({
-            "minute":       int(m),
-            "distance_m":   distance,
-            "hsr_s":        hsr,
-            "sprint_s":     sprint,
-            "sprint_count": sprintc,
-            "psv95":        psv95,
-            "n_high_accel": accel_s,
-            "n_high_decel": decel_s,
-            "z1_m":         zone_m[0], "z2_m": zone_m[1], "z3_m": zone_m[2],
-            "z4_m":         zone_m[3], "z5_m": zone_m[4],
-            "hmld_m":       hmld,
-            "n_frames":     int(mask.sum()),
+            "minute_in_period": int(m),
+            "distance_m":       distance,
+            "hsr_s":            hsr,
+            "sprint_s":         sprint,
+            "sprint_count":     sprintc,
+            "psv95":            psv95,
+            "n_high_accel":     accel_s,
+            "n_high_decel":     decel_s,
+            "z1_m":             zone_m[0], "z2_m": zone_m[1], "z3_m": zone_m[2],
+            "z4_m":             zone_m[3], "z5_m": zone_m[4],
+            "hmld_m":           hmld,
+            "n_frames":         int(mask.sum()),
         })
     return rows
 
@@ -464,16 +464,17 @@ def _phys_metrics_per_minute(match_id: int) -> pl.DataFrame:
         minutes_in_period = ((fn - period_start) // frames_per_min).astype(np.int64)
         for r in _aggregate_minute_metrics(speed, signed_a,
                                             p_meta, minutes_in_period, dt):
-            r["pff_match_id"] = match_id
-            r["player_id"]    = pid
-            r["period"]       = per
+            r["pff_match_id"]  = match_id
+            r["pff_player_id"] = pid
+            r["period"]        = per
             rows_out.append(r)
 
     if not rows_out:
         return pl.DataFrame(schema=_PHYS_SCHEMA)
     out = pl.DataFrame(rows_out, schema_overrides=_PHYS_SCHEMA)
-    # (player, period, minute) ya es unique por construccion.
-    return out.sort(["pff_match_id", "player_id", "period", "minute"])
+    # (player, period, minute_in_period) ya es unique por construccion.
+    return out.sort(["pff_match_id", "pff_player_id",
+                      "period", "minute_in_period"])
 
 
 def build_raw_per_minute(cache: bool = True, overwrite: bool = False) -> pl.DataFrame:
@@ -582,10 +583,10 @@ def _prepare_targets(df: pl.DataFrame
     log_hsr = np.log(df_clean["hsr_rate"].to_numpy() + _HSR_RATE_FLOOR)
     y = np.stack([log_psv, log_ms, log_hsr], axis=-1)
     period = df_clean["period"].to_numpy()
-    minute = df_clean["minute"].to_numpy()
+    minute = df_clean["minute_in_period"].to_numpy()
     offset = np.array([PERIOD_OFFSET_MIN.get(int(p), 0) for p in period])
     minute_norm = (offset + minute) / 90.0
-    return y, minute_norm, df_clean["player_id"].to_numpy()
+    return y, minute_norm, df_clean["pff_player_id"].to_numpy()
 
 
 def fit_phys_model(df_with_rates: pl.DataFrame,
@@ -682,13 +683,13 @@ def compute_score_phys(df_with_rates: pl.DataFrame, fit: dict) -> pl.DataFrame:
     p = fit["params"]
     p_to_idx = fit["p_to_idx"]
 
-    # Mismo filter que entrenamiento + map player_id -> idx
+    # Mismo filter que entrenamiento + map pff_player_id -> idx
     df_full = df_with_rates.filter(
         (pl.col("psv95") > 0.5) &
         (pl.col("mean_speed_mps") > 0.1) &
         (pl.col("n_frames") >= 200)
     ).with_columns(
-        pl.col("player_id").replace_strict(p_to_idx, default=-1).alias("p_idx")
+        pl.col("pff_player_id").replace_strict(p_to_idx, default=-1).alias("p_idx")
     ).filter(pl.col("p_idx") >= 0)
 
     if df_full.height == 0:
@@ -696,7 +697,7 @@ def compute_score_phys(df_with_rates: pl.DataFrame, fit: dict) -> pl.DataFrame:
 
     p_idx = df_full["p_idx"].to_numpy()
     period = df_full["period"].to_numpy()
-    minute = df_full["minute"].to_numpy()
+    minute = df_full["minute_in_period"].to_numpy()
     offset = np.array([PERIOD_OFFSET_MIN.get(int(pp), 0) for pp in period])
     mn = (offset + minute) / 90.0
     log_psv = np.log(df_full["psv95"].to_numpy())
@@ -716,13 +717,18 @@ def compute_score_phys(df_with_rates: pl.DataFrame, fit: dict) -> pl.DataFrame:
     z_per_target = residual / sigma_eps[None, :]
     score_phys = z_per_target.mean(axis=1)
 
+    # sec_abs derivado de PERIOD_OFFSET_MIN para alinear con M07 windows.
+    # Resolucion del minuto, el residual del modelo es per-minuto.
     return df_full.with_columns([
         pl.Series("z_psv95",     z_per_target[:, 0]),
         pl.Series("z_meanspd",   z_per_target[:, 1]),
         pl.Series("z_hsr",       z_per_target[:, 2]),
         pl.Series("score_phys",  score_phys),
+        ((pl.col("period").replace_strict(PERIOD_OFFSET_MIN, default=0)
+          + pl.col("minute_in_period")) * 60).cast(pl.Int64).alias("sec_abs"),
     ]).select([
-        "pff_match_id", "player_id", "period", "minute",
+        "pff_match_id", "pff_player_id",
+        "period", "minute_in_period", "sec_abs",
         "z_psv95", "z_meanspd", "z_hsr", "score_phys",
     ])
 
@@ -762,52 +768,81 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
     if cache and cache_path.exists():
         return pl.read_parquet(cache_path)
 
-    pm = cache_score_phys()                                # (pff_match_id, player_id, period, minute, ...)
+    pm = cache_score_phys()
     shocks = build_shocks_table(cache=True, overwrite=False)
 
+    # Schema X3: M11 per_minute publica sec_abs ya alineado con M07 windows
+    # (que tambien estan en sec_abs PFF). Join por (pff_match_id, pff_player_id)
+    # y filter por window selecciona automaticamente period correcto.
     pm = pm.rename({"pff_match_id": "match_id"})
-
-    # M07 t_event_seconds y window_* son ABSOLUTE seconds desde el inicio del
-    # partido (SB minute es absolute, sgc = m_abs*60 + s). M11 `minute` es
-    # period-relative, asi que para cruzar:
-    #   minute_abs_sec = (PERIOD_OFFSET_MIN[period] + minute) * 60
-    # Join solo por (match_id, player_id) — el filter por window absolute
-    # selecciona automaticamente los rows del period correcto.
-    pm = pm.with_columns(
-        ((pl.col("period").replace_strict(PERIOD_OFFSET_MIN, default=0)
-          + pl.col("minute")) * 60).cast(pl.Int64).alias("min_sec_abs")
-    )
-
     shocks_slim = shocks.select([
         "match_id", "shock_id", "player_id", "shock_type",
+        pl.col("period").alias("shock_period"),
         "window_pre_start", "window_pre_end",
         "window_post_start", "window_post_end",
-    ])
+    ]).rename({"player_id": "pff_player_id"})
 
-    joined = shocks_slim.join(pm, on=["match_id", "player_id"], how="left")
+    joined = shocks_slim.join(pm, on=["match_id", "pff_player_id"], how="left")
 
+    # period == shock_period evita contaminacion cross-period (ver M08 doc)
     pre = joined.filter(
-        (pl.col("min_sec_abs") >= pl.col("window_pre_start")) &
-        (pl.col("min_sec_abs") < pl.col("window_pre_end"))
-    ).group_by(["match_id", "shock_id", "player_id", "shock_type"]).agg([
+        (pl.col("sec_abs") >= pl.col("window_pre_start")) &
+        (pl.col("sec_abs") < pl.col("window_pre_end")) &
+        (pl.col("period") == pl.col("shock_period"))
+    ).group_by(["match_id", "shock_id", "pff_player_id", "shock_type"]).agg([
         pl.col("score_phys").mean().alias("score_phys_pre"),
         pl.col("z_psv95").mean().alias("z_psv95_pre"),
         pl.col("z_meanspd").mean().alias("z_meanspd_pre"),
         pl.col("z_hsr").mean().alias("z_hsr_pre"),
     ])
     post = joined.filter(
-        (pl.col("min_sec_abs") >= pl.col("window_post_start")) &
-        (pl.col("min_sec_abs") <= pl.col("window_post_end"))
-    ).group_by(["match_id", "shock_id", "player_id", "shock_type"]).agg([
+        (pl.col("sec_abs") >= pl.col("window_post_start")) &
+        (pl.col("sec_abs") <= pl.col("window_post_end")) &
+        (pl.col("period") == pl.col("shock_period"))
+    ).group_by(["match_id", "shock_id", "pff_player_id", "shock_type"]).agg([
         pl.col("score_phys").mean().alias("score_phys_post"),
         pl.col("z_psv95").mean().alias("z_psv95_post"),
         pl.col("z_meanspd").mean().alias("z_meanspd_post"),
         pl.col("z_hsr").mean().alias("z_hsr_post"),
     ])
 
-    base = shocks.select(["match_id", "shock_id", "player_id", "shock_type"]).unique()
-    out = base.join(pre,  on=["match_id", "shock_id", "player_id", "shock_type"], how="left") \
-              .join(post, on=["match_id", "shock_id", "player_id", "shock_type"], how="left")
+    base = shocks.select([
+        "match_id", "shock_id", "player_id", "shock_type"
+    ]).rename({"player_id": "pff_player_id"}).unique()
+
+    # ids canonicos (X3): sb_match_id + sb_player_id via mappings publicos.
+    from M03_preprocess import pff_to_sb_match_id
+    import M08_ataque as atk
+    pff2sb_match = pff_to_sb_match_id()
+    pff_to_sb_pl = atk.build_sb_to_pff_player_map(cache=True).select([
+        pl.col("pff_player_id").cast(pl.Int64, strict=False),
+        pl.col("sb_player_id").cast(pl.Int64),
+    ]).filter(pl.col("pff_player_id").is_not_null()).unique(
+        subset=["pff_player_id"], keep="first",
+    )
+
+    out = (
+        base
+        .join(pre,  on=["match_id", "shock_id", "pff_player_id", "shock_type"],
+              how="left")
+        .join(post, on=["match_id", "shock_id", "pff_player_id", "shock_type"],
+              how="left")
+        .rename({"match_id": "pff_match_id"})
+        .join(pff_to_sb_pl, on="pff_player_id", how="left")
+        .with_columns(
+            pl.col("pff_match_id").replace_strict(pff2sb_match, default=None)
+                                    .alias("sb_match_id")
+        )
+        .select([
+            "pff_match_id", "sb_match_id",
+            "shock_id", "shock_type",
+            "pff_player_id", "sb_player_id",
+            "score_phys_pre", "score_phys_post",
+            "z_psv95_pre", "z_psv95_post",
+            "z_meanspd_pre", "z_meanspd_post",
+            "z_hsr_pre", "z_hsr_post",
+        ])
+    )
 
     if cache:
         out.write_parquet(cache_path, compression="snappy")
@@ -829,7 +864,7 @@ if __name__ == "__main__":
     print(f"  matches: {raw['pff_match_id'].n_unique()}/64, players: {raw['player_id'].n_unique()}")
 
     # Acceptance Bradley 2024: filtrar SOLO STARTERS (>= 60 min jugados)
-    per_pm = raw.group_by(["pff_match_id", "player_id"]).agg([
+    per_pm = raw.group_by(["pff_match_id", "pff_player_id"]).agg([
         pl.col("distance_m").sum().alias("dist_m"),
         pl.col("hsr_s").sum().alias("hsr_s"),
         pl.col("sprint_s").sum().alias("sprint_s"),
@@ -865,7 +900,8 @@ if __name__ == "__main__":
         (pl.col("dist_m")/1000).round(2).alias("km"),
         (pl.col("peak_mps")*3.6).round(1).alias("peak_kmh"),
     ).sort("km", descending=True).head(10).select(
-        ["player_id","km","hsr_s","sprint_s","n_sprints","peak_kmh","accel_s","decel_s"]
+        ["pff_player_id","km","hsr_s","sprint_s","n_sprints","peak_kmh",
+         "accel_s","decel_s"]
     ))
 
     # Paso 3-4: Modelo bayesiano residualizado + score_phys + per_shock_window

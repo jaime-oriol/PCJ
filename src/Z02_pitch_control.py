@@ -21,7 +21,7 @@ Schema esperado en `frame_data` (1 fila por jugador + 1 fila por balon):
 API publica:
     default_model_params  : parametros PPCF (Spearman 2018).
     ppcf_at_targets       : PPCF a posiciones especificas (vectorizado N targets).
-    _get_ball_pos         : extrae posicion del balon de un frame.
+    get_ball_pos          : extrae posicion del balon de un frame.
 
 Reference: Spearman 2018 "Beyond Expected Goals".
 """
@@ -208,8 +208,12 @@ def _extract_teams(frame_data: pd.DataFrame, att_team_id):
     return _arrays(att), _arrays(def_)
 
 
-def _get_ball_pos(frame_data: pd.DataFrame) -> Optional[np.ndarray]:
-    """Extract ball position in meters from a tracking frame."""
+def get_ball_pos(frame_data: pd.DataFrame) -> Optional[np.ndarray]:
+    """Extract ball position in meters from a tracking frame.
+
+    API publica usada por M10 para extraer la posicion del balon antes de
+    invocar `ppcf_at_targets`.
+    """
     ball = frame_data[frame_data["is_ball"] == 1]
     if ball.empty:
         return None
@@ -247,7 +251,7 @@ def ppcf_at_targets(
     if params is None:
         params = default_model_params()
     if ball_pos is None:
-        ball_pos = _get_ball_pos(frame_data)
+        ball_pos = get_ball_pos(frame_data)
 
     (att_pos, att_vel, att_gk), (def_pos, def_vel, def_gk) = _extract_teams(
         frame_data, att_team_id

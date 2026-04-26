@@ -21,7 +21,8 @@ Pipeline:
   4. Optuna tuning (TPE, 3-fold CV by match) + train CatBoost 5-fold CV by match
      + isotonic calibration + final model sobre todo el training.
   5. Apply a WC22 atomic actions -> offensive_value per action.
-  6. Aggregate: (match_id, player_id_sb, minute, score_atk_minute, n_actions).
+  6. Aggregate: (sb_match_id, pff_match_id, sb_player_id, pff_player_id,
+     period, minute_in_period, sec_abs, score_atk_minute, vaep_minute, n_actions).
   7. Map player_id_sb -> player_id_pff (nombre+equipo exacto, fallback last-name
      unico dentro del equipo).
   8. Aggregate per shock-window (pre/post -10/+10 min).
@@ -31,8 +32,10 @@ Output:
     training_atomic.parquet      # atomic actions training (cached)
     wc22_atomic.parquet          # atomic actions WC22 (cached)
     model/vaep_atk_{scores,concedes}.cbm + vaep_atk_meta.pkl
-    per_minute.parquet           # (sb_match_id, sb_player_id, minute, score_atk_minute, ...)
-    per_shock_window.parquet     # (match_id, shock_id, pff_player_id, shock_type, pre/post)
+    per_minute.parquet           # ambos ids + period + minute_in_period + sec_abs
+                                 #   + score_atk_minute, vaep_minute, n_actions
+    per_shock_window.parquet     # (pff_match_id, sb_match_id, shock_id,
+                                 #   pff_player_id, sb_player_id, shock_type, pre/post)
     sb_to_pff_player_map.parquet # mapping explicito
 
 Acceptance (ARCHITECTURE): distribucion score_atk por rol coherente (CFs > CBs).
@@ -98,18 +101,22 @@ def _build_atomic_actions(comps: list[tuple], cache_name: str,
         games = SB_LOADER.games(competition_id=cid, season_id=sid)
         print(f"  [{alias}] {len(games)} partidos...", flush=True)
         for _, g in games.iterrows():
+            # Suprime warnings de socceraction (xy_fidelity_version inferido +
+            # FutureWarning de pandas chained-assignment dentro de spadl.statsbomb).
+            # Cubre TODAS las llamadas socceraction (events + convert_to_actions
+            # + convert_to_atomic), no solo events.
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                events = SB_LOADER.events(game_id=int(g.game_id))
-            try:
-                actions = spadl.statsbomb.convert_to_actions(
-                    events, home_team_id=int(g.home_team_id)
-                )
-                atomic = convert_to_atomic(actions)
-                atomic["_competition"] = alias
-                all_atomic.append(atomic)
-            except Exception as e:
-                print(f"    skip game {g.game_id}: {e}")
+                try:
+                    events = SB_LOADER.events(game_id=int(g.game_id))
+                    actions = spadl.statsbomb.convert_to_actions(
+                        events, home_team_id=int(g.home_team_id),
+                    )
+                    atomic = convert_to_atomic(actions)
+                    atomic["_competition"] = alias
+                    all_atomic.append(atomic)
+                except Exception as e:
+                    print(f"    skip game {g.game_id}: {e}")
     df = pd.concat(all_atomic, ignore_index=True)
     df = atomic_add_names(df)
     _DERIVED.mkdir(parents=True, exist_ok=True)
@@ -357,7 +364,7 @@ def apply_vaep_to_wc22(fit: dict,
         p_s = fit["cal_s"].predict(p_s)
     if fit.get("cal_c") is not None:
         p_c = fit["cal_c"].predict(p_c)
-    values = vaep_mod._formula_mod(atomic=True).value(
+    values = vaep_mod.formula_mod(atomic=True).value(
         wc22_atomic.reset_index(drop=True),
         pd.Series(p_s), pd.Series(p_c),
     )
@@ -370,29 +377,65 @@ def apply_vaep_to_wc22(fit: dict,
 
 def aggregate_per_player_minute(wc22_with_vaep: pd.DataFrame,
                                  cache: bool = True) -> pl.DataFrame:
-    """Agrega atomic-VAEP por (match_id, player_id_sb, minute).
+    """Agrega atomic-VAEP por (sb_match_id, sb_player_id, period, minute_in_period).
 
-    score_atk_minute = sum(offensive_value) de acciones ON-BALL del jugador.
+    Schema extendido (X3): incluye `pff_match_id`, `pff_player_id`, `sec_abs`
+    (segundos absolutos desde inicio de partido) para que M12 DiD pueda alinear
+    con M07 windows sin reconvertir time_seconds. minute_in_period es 0..44.
     """
     cache_path = _DERIVED / "per_minute.parquet"
     if cache and cache_path.exists():
         return pl.read_parquet(cache_path)
+
+    from M03_preprocess import sb_to_pff_match_id
 
     df = pl.from_pandas(wc22_with_vaep[[
         "game_id", "period_id", "time_seconds", "team_id",
         "player_id", "offensive_value", "vaep_value",
     ]])
     df = df.with_columns([
-        (pl.col("time_seconds") // 60
-         + (pl.col("period_id") - 1) * 45).cast(pl.Int64).alias("minute"),
+        (pl.col("time_seconds") // 60).cast(pl.Int64).alias("minute_in_period"),
+        # sec_abs: SB period_id 1..5 con periodos de 45 min -> offset (p-1)*45*60.
+        # Approx: para period 2 con stoppage de period 1 quedan 60s desfase
+        # vs PFF sgc, aceptable porque M07 window son ±600s.
+        ((pl.col("period_id") - 1) * 45 * 60
+         + pl.col("time_seconds")).cast(pl.Int64).alias("sec_abs"),
     ])
     df = df.filter(pl.col("player_id").is_not_null())
 
-    agg = df.group_by(["game_id", "player_id", "minute"]).agg([
+    agg = df.group_by(
+        ["game_id", "period_id", "player_id", "minute_in_period"],
+    ).agg([
         pl.col("offensive_value").sum().alias("score_atk_minute"),
         pl.col("vaep_value").sum().alias("vaep_minute"),
+        pl.col("sec_abs").min().alias("sec_abs"),
         pl.len().cast(pl.Int64).alias("n_actions"),
-    ]).rename({"game_id": "sb_match_id", "player_id": "sb_player_id"})
+    ]).rename({
+        "game_id":   "sb_match_id",
+        "player_id": "sb_player_id",
+        "period_id": "period",
+    })
+
+    # Anadir pff ids via mappings publicos (X1+X2)
+    sb2pff_match = sb_to_pff_match_id()
+    pmap = build_sb_to_pff_player_map(cache=True).select([
+        pl.col("sb_player_id").cast(pl.Int64),
+        pl.col("pff_player_id").cast(pl.Int64, strict=False),
+    ])
+    agg = agg.with_columns([
+        pl.col("sb_match_id").cast(pl.Int64),
+        pl.col("sb_player_id").cast(pl.Int64),
+        pl.col("sb_match_id").replace_strict(sb2pff_match, default=None)
+                              .alias("pff_match_id"),
+    ]).join(pmap, on="sb_player_id", how="left")
+
+    # Orden final canonico: ids -> tiempo -> metricas
+    agg = agg.select([
+        "pff_match_id", "sb_match_id",
+        "pff_player_id", "sb_player_id",
+        "period", "minute_in_period", "sec_abs",
+        "score_atk_minute", "vaep_minute", "n_actions",
+    ])
 
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -516,25 +559,23 @@ def build_sb_to_pff_player_map(cache: bool = True) -> pl.DataFrame:
 #  SECCION 5 — Aggregate per shock window (pre/post ±10 min)
 # ===========================================================================
 
-def _sb_to_pff_match_map() -> dict[int, int]:
-    """Mapping SB match_id -> PFF match_id (mismo que M03)."""
-    from M03_preprocess import _pff_to_sb_match_id
-    return {v: k for k, v in _pff_to_sb_match_id().items()}
-
-
 def aggregate_per_shock_window(per_minute: pl.DataFrame,
                                 player_map: pl.DataFrame,
                                 shocks: pl.DataFrame | None = None,
                                 cache: bool = True) -> pl.DataFrame:
     """Por cada (shock, player), suma score_atk en pre/post windows.
 
-    Args:
-        per_minute: (sb_match_id, sb_player_id, minute, score_atk_minute, ...).
-        player_map: (sb_player_id, pff_player_id) mapping.
-        shocks: tabla de M07 (si None, se carga del cache).
+    Schema (X3): publica `pff_match_id`, `sb_match_id`, `pff_player_id`,
+    `sb_player_id` y filtra por `sec_abs` real (no minute*60 sintetico).
 
-    Returns: (match_id, shock_id, player_id_pff, shock_type,
-              score_atk_pre, score_atk_post, n_actions_pre, n_actions_post).
+    Args:
+        per_minute: schema canonico M08.aggregate_per_player_minute, con
+                    cols `pff_match_id`, `sb_match_id`, `pff_player_id`,
+                    `sb_player_id`, `sec_abs`, `score_atk_minute`, `n_actions`.
+        player_map: (sb_player_id, pff_player_id) mapping (no usado si
+                    per_minute ya trae pff_player_id; param mantenido por
+                    compatibilidad).
+        shocks: tabla de M07 (si None, se carga del cache).
     """
     cache_path = _DERIVED / "per_shock_window.parquet"
     if cache and cache_path.exists():
@@ -543,65 +584,84 @@ def aggregate_per_shock_window(per_minute: pl.DataFrame,
     if shocks is None:
         shocks = build_shocks_table(cache=True, overwrite=False)
 
-    # Map SB match_id -> PFF match_id
-    sb2pff = _sb_to_pff_match_map()
-    per_min = per_minute.with_columns(
-        pl.col("sb_match_id").replace_strict(sb2pff, default=None).alias("match_id")
-    ).filter(pl.col("match_id").is_not_null())
+    per_min = per_minute.filter(
+        pl.col("pff_match_id").is_not_null() &
+        pl.col("pff_player_id").is_not_null()
+    ).rename({"pff_match_id": "match_id"})
 
-    # Map sb_player_id -> pff_player_id (cast to ensure same dtype)
-    per_min = per_min.with_columns(pl.col("sb_player_id").cast(pl.Int64))
-    pm_cast = player_map.select(["sb_player_id", "pff_player_id"]).with_columns([
-        pl.col("sb_player_id").cast(pl.Int64),
-        pl.col("pff_player_id").cast(pl.Int64, strict=False),
-    ])
-    per_min = per_min.join(pm_cast, on="sb_player_id", how="left") \
-                      .filter(pl.col("pff_player_id").is_not_null())
-
-    # Join shocks + filter por ventana pre/post:
-    # pre: minute in [window_pre_start//60, window_pre_end//60)
-    # post: minute in [window_post_start//60, window_post_end//60]
     shocks_slim = shocks.select([
         "match_id", "shock_id", "player_id", "shock_type",
+        pl.col("period").alias("shock_period"),
         "window_pre_start", "window_pre_end",
         "window_post_start", "window_post_end",
     ]).rename({"player_id": "pff_player_id"})
 
-    # Join por (match_id, player_id) y luego compute pre/post aggs
-    joined = shocks_slim.join(per_min, on=["match_id", "pff_player_id"], how="left")
-    # minute en segundos = minute * 60 (approx)
-    joined = joined.with_columns(
-        (pl.col("minute") * 60).alias("min_sec")
+    joined = shocks_slim.join(
+        per_min, on=["match_id", "pff_player_id"], how="left",
     )
-    # Calcular pre/post sums
+
+    # Filtra por sec_abs real (X3+X4) Y period == shock_period. PFF sgc usa
+    # convencion period-displayed-clock, asi que sec_abs de un evento period 1
+    # stoppage (e.g., 2820) puede colisionar con sec_abs de un evento period 2
+    # minuto 2 (tambien 2820). Sin filtrar period, ~8% de eventos contaminan
+    # cross-period (medido empiricamente). Pre [t-600, t), post (t, t+600].
     pre = joined.filter(
-        (pl.col("min_sec") >= pl.col("window_pre_start")) &
-        (pl.col("min_sec") < pl.col("window_pre_end"))
+        (pl.col("sec_abs") >= pl.col("window_pre_start")) &
+        (pl.col("sec_abs") < pl.col("window_pre_end")) &
+        (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("score_atk_minute").sum().alias("score_atk_pre"),
         pl.col("n_actions").sum().cast(pl.Int64).alias("n_actions_pre"),
     ])
     post = joined.filter(
-        (pl.col("min_sec") >= pl.col("window_post_start")) &
-        (pl.col("min_sec") <= pl.col("window_post_end"))
+        (pl.col("sec_abs") >= pl.col("window_post_start")) &
+        (pl.col("sec_abs") <= pl.col("window_post_end")) &
+        (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
         pl.col("score_atk_minute").sum().alias("score_atk_post"),
         pl.col("n_actions").sum().cast(pl.Int64).alias("n_actions_post"),
     ])
 
-    # Full list de (match_id, shock_id, player_id, shock_type) desde shocks
     base = shocks.select([
         "match_id", "shock_id", "player_id", "shock_type"
     ]).rename({"player_id": "pff_player_id"}).unique()
 
-    out = base.join(pre,  on=["match_id","shock_id","pff_player_id","shock_type"], how="left") \
-              .join(post, on=["match_id","shock_id","pff_player_id","shock_type"], how="left") \
-              .with_columns([
-                  pl.col("score_atk_pre").fill_null(0.0),
-                  pl.col("score_atk_post").fill_null(0.0),
-                  pl.col("n_actions_pre").fill_null(0),
-                  pl.col("n_actions_post").fill_null(0),
-              ])
+    pff_to_sb_pl = player_map.select([
+        pl.col("pff_player_id").cast(pl.Int64, strict=False),
+        pl.col("sb_player_id").cast(pl.Int64),
+    ]).filter(pl.col("pff_player_id").is_not_null()).unique(
+        subset=["pff_player_id"], keep="first",
+    )
+
+    from M03_preprocess import pff_to_sb_match_id
+    pff2sb_match = pff_to_sb_match_id()
+
+    out = (
+        base
+        .join(pre,  on=["match_id","shock_id","pff_player_id","shock_type"],
+              how="left")
+        .join(post, on=["match_id","shock_id","pff_player_id","shock_type"],
+              how="left")
+        .with_columns([
+            pl.col("score_atk_pre").fill_null(0.0),
+            pl.col("score_atk_post").fill_null(0.0),
+            pl.col("n_actions_pre").fill_null(0),
+            pl.col("n_actions_post").fill_null(0),
+        ])
+        .rename({"match_id": "pff_match_id"})
+        .join(pff_to_sb_pl, on="pff_player_id", how="left")
+        .with_columns(
+            pl.col("pff_match_id").replace_strict(pff2sb_match, default=None)
+                                    .alias("sb_match_id")
+        )
+        .select([
+            "pff_match_id", "sb_match_id",
+            "shock_id", "shock_type",
+            "pff_player_id", "sb_player_id",
+            "score_atk_pre", "score_atk_post",
+            "n_actions_pre", "n_actions_post",
+        ])
+    )
 
     if cache:
         out.write_parquet(cache_path, compression="snappy")
@@ -696,17 +756,13 @@ if __name__ == "__main__":
     print("  score_atk por shock_type:")
     print(summary)
 
-    # Sanity acceptance: score_atk por rol (CFs > CBs)
+    # Sanity acceptance: score_atk por rol (CFs > CBs).
+    # per_min ya trae pff_player_id (schema X3 estandarizado).
     print("\n[8] Acceptance — distribucion score_atk por rol:")
-    pm_cast = per_min.with_columns(pl.col("sb_player_id").cast(pl.Int64))
-    map_cast = mapping.select(["sb_player_id","pff_player_id"]).with_columns([
-        pl.col("sb_player_id").cast(pl.Int64),
-        pl.col("pff_player_id").cast(pl.Int64, strict=False),
-    ])
-    pm_with_role = pm_cast.join(map_cast, on="sb_player_id", how="left")
-    pm_with_role = pm_with_role.filter(pl.col("pff_player_id").is_not_null())
-    pm_with_role = pm_with_role.join(
-        load_rosters().select(["player_id","position_group"]).unique(subset=["player_id"]).rename({"player_id":"pff_player_id"}),
+    pm_with_role = per_min.filter(pl.col("pff_player_id").is_not_null()).join(
+        load_rosters().select(["player_id","position_group"])
+                       .unique(subset=["player_id"])
+                       .rename({"player_id":"pff_player_id"}),
         on="pff_player_id", how="left",
     )
     by_role = pm_with_role.group_by("position_group").agg([

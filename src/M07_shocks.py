@@ -13,8 +13,22 @@ Flags (propuesta §M07):
   truncated_pre  : ventana pre recortada por inicio partido / transicion periodo
   truncated_post : ventana post recortada por fin partido / transicion periodo
   overlap_flag   : otro shock (goal) en ±10 min del mismo partido
-  sub_in_window  : jugador entra / sale en la ventana pre o post
+  sub_in_window  : jugador entra (minute_in) o sale (minute_out) DENTRO de
+                   la ventana pre [t-600, t) o post (t, t+600]. Politica:
+                     - Solo flagea, NO excluye filas. M12 DiD/M13 AIPW pueden
+                       censurar (IPCW Robins 1994) o excluir cuando flag=True.
+                     - No marca jugadores que estaban en campo y salieron POR
+                       el shock como reaccion tactica del entrenador (la
+                       sustitucion-respuesta no es selection bias en pre, pero
+                       SI puede serlo en post si fue causada por el resultado).
+                       Capturable downstream con sub_off_minute > t (dentro
+                       de window_post).
   et_flag        : shock en tiempo extra (period 3 o 4)
+
+Convencion de tiempos:
+  t_event_seconds, window_*_start/end estan en `start_game_clock` ABSOLUTO
+  PFF (segundos desde inicio del partido). M03.goals_timeline ya resuelve el
+  sgc real PFF (no sintetizado m*60+s SB), critico para alinear stoppage.
 
 Output: data/parquet/derived/shocks/shocks_table.parquet
 

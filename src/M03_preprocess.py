@@ -88,8 +88,12 @@ def attacking_direction(match_id: int) -> pl.DataFrame:
 _PFF_SB_MATCH_CACHE: dict[int, int] | None = None
 
 
-def _pff_to_sb_match_id() -> dict[int, int]:
-    """Mapea PFF match_id -> SB match_id para WC22 via (home, away, date)."""
+def pff_to_sb_match_id() -> dict[int, int]:
+    """Mapea PFF match_id -> SB match_id para WC22 (64 partidos).
+
+    Join por (home_team_name, away_team_name, date). Cacheado en module-global
+    tras la primera llamada (los nombres no cambian dentro del torneo).
+    """
     global _PFF_SB_MATCH_CACHE
     if _PFF_SB_MATCH_CACHE is not None:
         return _PFF_SB_MATCH_CACHE
@@ -112,12 +116,69 @@ def _pff_to_sb_match_id() -> dict[int, int]:
     return mapping
 
 
+def sb_to_pff_match_id() -> dict[int, int]:
+    """Mapping inverso SB match_id -> PFF match_id para WC22."""
+    return {v: k for k, v in pff_to_sb_match_id().items()}
+
+
+# Backward-compat alias (M08, M09 lo importan como privado historicamente).
+_pff_to_sb_match_id = pff_to_sb_match_id
+
+
 _GOALS_SCHEMA = {
     "match_id": pl.Int64, "period": pl.Int64,
     "start_game_clock": pl.Int64, "minute": pl.Int64,
     "scoring_team_id": pl.Int64, "is_own_goal": pl.Boolean,
     "cum_home": pl.Int64, "cum_away": pl.Int64,
 }
+
+
+def _pff_goal_sgc_lookup(match_id: int) -> dict[tuple[int, str], list[int]]:
+    """Devuelve {(period, side): [sgc...]} desde PFF OUT events con outType H/A.
+
+    Lista canonica de instantes (PFF clock) en que el balon sale de juego por
+    gol, segun PFF spec EVENT_DATA_SPEC §2 (`outType` 'H'=Home Score,
+    'A'=Away Score). Mas fiable que sintetizar `m*60+s` desde SB minute,
+    que pierde precision en stoppage. Usado por `goals_timeline` para
+    reemplazar el sgc sintetico por el real.
+    """
+    ev = load_events(match_id)
+    out = ev.filter(
+        (pl.col("gameEvents").struct.field("gameEventType") == "OUT") &
+        pl.col("gameEvents").struct.field("outType").is_in(["H", "A"])
+    ).select([
+        pl.col("gameEvents").struct.field("period").alias("period"),
+        pl.col("gameEvents").struct.field("startGameClock").alias("sgc"),
+        pl.col("gameEvents").struct.field("outType").alias("side"),
+    ]).sort("sgc")
+
+    bucket: dict[tuple[int, str], list[int]] = {}
+    for r in out.iter_rows(named=True):
+        bucket.setdefault((int(r["period"]), r["side"]), []).append(int(r["sgc"]))
+    return bucket
+
+
+def _resolve_pff_sgc(rows: list[dict], home_id: int,
+                      pff_lookup: dict[tuple[int, str], list[int]]) -> None:
+    """Reemplaza in-place el `start_game_clock` sintetico por sgc real PFF.
+
+    Para cada gol SB, busca el PFF OUT event mas cercano (mismo period+side)
+    que aun no haya sido asignado a otro gol. Greedy desde el orden cronologico
+    SB. Si no hay candidatos, mantiene el sintetico (graceful degrade).
+    """
+    used: set[tuple[int, str, int]] = set()
+    for row in rows:
+        side = "H" if row["scoring_team_id"] == home_id else "A"
+        key = (row["period"], side)
+        cands = pff_lookup.get(key, [])
+        sb_sec = row["start_game_clock"]
+        free = [c for c in cands if (key[0], key[1], c) not in used]
+        if not free:
+            continue
+        best = min(free, key=lambda c: abs(c - sb_sec))
+        used.add((key[0], key[1], best))
+        row["start_game_clock"] = best
+        row["minute"] = best // 60
 
 
 def _goals_timeline_pff_fallback(match_id: int, home_id: int,
@@ -165,7 +226,7 @@ def goals_timeline(match_id: int) -> pl.DataFrame:
     away_id = md["away_team_id"]
     home_name = md["home_team_name"]
 
-    mapping = _pff_to_sb_match_id()
+    mapping = pff_to_sb_match_id()
     sb_mid = mapping.get(match_id)
     if sb_mid is None:
         # Partido PFF sin mapping SB: fallback a PFF raw filtrando disallowed +
@@ -227,6 +288,14 @@ def goals_timeline(match_id: int) -> pl.DataFrame:
 
     if not rows:
         return pl.DataFrame(schema=_GOALS_SCHEMA)
+
+    # Reemplaza el sgc sintetico (m*60+s desde SB) por el sgc real PFF via
+    # OUT events outType H/A. Critico en stoppage donde SB minute es int sin
+    # los segundos extra y el desfase puede llegar a >60s — sufficient para
+    # romper alineacion con M07 windows y M08-M11 per_minute aggs.
+    pff_lookup = _pff_goal_sgc_lookup(match_id)
+    rows.sort(key=lambda r: r["start_game_clock"])
+    _resolve_pff_sgc(rows, home_id, pff_lookup)
 
     df = pl.DataFrame(rows).sort("start_game_clock").with_columns([
         (pl.col("scoring_team_id") == home_id).cast(pl.Int64).cum_sum().alias("cum_home"),
@@ -332,11 +401,12 @@ def player_minutes(match_id: int) -> pl.DataFrame:
 
 # -- Enrich events (acceptance M03) -----------------------------------------
 
-def enrich_events(match_id: int, cache: bool = True) -> pl.DataFrame:
+def enrich_events(match_id: int, cache: bool = True,
+                   overwrite: bool = False) -> pl.DataFrame:
     """Events enriquecidos con cols planas + score state + direction + ball normalizado.
 
     Cols anadidas (sobre load_events original, structs preservadas):
-      - match_id, period, start_game_clock, match_second, minute
+      - match_id, period, start_game_clock (== sec_abs), minute
       - game_event_type, possession_event_type
       - team_id, team_name, player_id, player_name
       - score_home, score_away, score_diff_possession (state BEFORE evento)
@@ -345,10 +415,10 @@ def enrich_events(match_id: int, cache: bool = True) -> pl.DataFrame:
       - ball_x_norm, ball_y_norm (coords flipeadas: equipo en posesion ataca a x+)
 
     Cachea en data/parquet/derived/preprocess/events_enriched/{match_id}.parquet
-    si cache=True.
+    si cache=True. Con overwrite=True regenera incluso si el cache existe.
     """
     cache_path = _DERIVED / "events_enriched" / f"{match_id}.parquet"
-    if cache and cache_path.exists():
+    if cache and cache_path.exists() and not overwrite:
         return pl.read_parquet(cache_path)
 
     ev = load_events(match_id)
@@ -360,7 +430,6 @@ def enrich_events(match_id: int, cache: bool = True) -> pl.DataFrame:
         pl.col("gameId").cast(pl.Int64).alias("match_id"),
         ge.field("period").alias("period"),
         ge.field("startGameClock").alias("start_game_clock"),
-        ge.field("startGameClock").alias("match_second"),
         (ge.field("startGameClock") // 60).alias("minute"),
         ge.field("gameEventType").alias("game_event_type"),
         ge.field("teamId").alias("team_id"),
@@ -404,14 +473,18 @@ def enrich_events(match_id: int, cache: bool = True) -> pl.DataFrame:
 
 
 def cache_all_enriched(overwrite: bool = False) -> dict:
-    """Precomputa enrich_events de los 64 partidos y cachea a parquet."""
+    """Precomputa enrich_events de los 64 partidos y cachea a parquet.
+
+    overwrite=True propaga a enrich_events para que regenere el contenido
+    incluso si el parquet existe (antes el flag era no-op por bug interno).
+    """
     out = {}
     for mid in list_event_match_ids():
         p = _DERIVED / "events_enriched" / f"{mid}.parquet"
         if p.exists() and not overwrite:
             out[mid] = p
             continue
-        _ = enrich_events(mid, cache=True)
+        _ = enrich_events(mid, cache=True, overwrite=overwrite)
         out[mid] = p
     return out
 
