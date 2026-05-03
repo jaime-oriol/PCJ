@@ -25,30 +25,12 @@ from typing import Any
 
 import polars as pl
 
-from ._common import DATA_PUB, parquet_dir, write_parquet
+from ._common import (
+    DATA_PUB, clean_empty_strings, parquet_dir, write_parquet,
+)
 
-
-# -- Limpieza Wyscout -------------------------------------------------------
-
-_NULL_SENTINELS = {"", "null"}
-
-
-def _clean_empty_strings(obj: Any) -> Any:
-    """Convierte sentinelas Wyscout de "ausente" a None recursivamente.
-
-    Wyscout es inconsistente y usa "", "null" (string literal) y None
-    como sinonimos para "valor ausente" en campos numericos. Si lo dejamos
-    asi, polars infiere String para columnas que son int en 99% de las
-    filas (e.g. subEventId, currentTeamId), perdiendo el tipo.
-    Convertir todos a None preserva el lossless funcional.
-    """
-    if isinstance(obj, dict):
-        return {k: _clean_empty_strings(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_clean_empty_strings(x) for x in obj]
-    if isinstance(obj, str) and obj in _NULL_SENTINELS:
-        return None
-    return obj
+# Backward compat: alias privado del helper compartido (consumidores legacy)
+_clean_empty_strings = clean_empty_strings
 
 # -- Rutas ------------------------------------------------------------------
 
@@ -93,7 +75,7 @@ def extract_events(
         if not src.exists():
             continue
 
-        rows = _clean_empty_strings(json.load(open(src)))
+        rows = clean_empty_strings(json.load(open(src)))
         df = pl.from_dicts(rows, infer_schema_length=None)
         write_parquet(df, out, overwrite=overwrite)
         written[comp] = out
@@ -119,7 +101,7 @@ def extract_matches(overwrite: bool = False) -> Path:
         for m in json.load(open(src)):
             m["competition"] = comp
             rows.append(m)
-    rows = _clean_empty_strings(rows)
+    rows = clean_empty_strings(rows)
     df = pl.from_dicts(rows, infer_schema_length=None)
     return write_parquet(df, out, overwrite=overwrite)
 
@@ -138,7 +120,7 @@ def _extract_catalog(filename: str, overwrite: bool = False) -> Path | None:
         return out
     src = _WYSCOUT / filename
     try:
-        rows = _clean_empty_strings(json.load(open(src)))
+        rows = clean_empty_strings(json.load(open(src)))
     except json.JSONDecodeError as e:
         print(f"WARN: {filename} JSON corrupto, skip: {e}")
         return None

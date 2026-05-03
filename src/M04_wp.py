@@ -68,6 +68,7 @@ REG_MINUTES     = 90
 ET_MINUTES      = 30
 ELO_INIT        = 1500.0
 ELO_K           = 20.0
+_SHOTS_WINDOW   = 10       # minutos de la ventana rolling para shots_diff_recent
 
 # Mapeo periodo Wyscout -> offset de minuto absoluto
 _WYSCOUT_PERIOD_OFFSET = {"1H": 0, "2H": 45, "E1": 90, "E2": 105, "P": 120}
@@ -421,7 +422,6 @@ def compute_elo(meta: pl.DataFrame, k: float = ELO_K,
 #  SECCION 4 — Training matrix (match_id x minute_bin 1..90)
 # ===========================================================================
 
-_SHOTS_WINDOW = 10   # minutos de la ventana rolling para shots_diff_recent
 
 
 def _counts_per_match_minute(events: pl.DataFrame, meta: pl.DataFrame,

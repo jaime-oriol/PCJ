@@ -121,6 +121,31 @@ def deep_equal(a: Any, b: Any) -> bool:
     return _normalize(a) == _normalize(b)
 
 
+# -- Limpieza de sentinelas Wyscout (compartido entre wyscout + audit) -------
+
+_NULL_SENTINELS = {"", "null"}
+
+
+def clean_empty_strings(obj: Any) -> Any:
+    """Convierte sentinelas Wyscout de "ausente" a None recursivamente.
+
+    Wyscout es inconsistente y usa "", "null" (string literal) y None
+    como sinonimos para "valor ausente" en campos numericos. Si lo dejamos
+    asi, polars infiere String para columnas que son int en 99% de las
+    filas (e.g. subEventId, currentTeamId), perdiendo el tipo.
+    Convertir todos a None preserva el lossless funcional.
+
+    Vive en _common para evitar coupling cross-module (wyscout + audit).
+    """
+    if isinstance(obj, dict):
+        return {k: clean_empty_strings(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clean_empty_strings(x) for x in obj]
+    if isinstance(obj, str) and obj in _NULL_SENTINELS:
+        return None
+    return obj
+
+
 def roundtrip_check(
     original_json_path: Path,
     parquet_path: Path,
