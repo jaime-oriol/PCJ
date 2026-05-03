@@ -57,7 +57,13 @@ src/
 │                           #   Indice Cerrojo (def_GF + phys_GF) + ranking
 │                           #   within position. 598 jugadores con (β_atk,
 │                           #   β_def, β_off, β_phys) IC 80%/95%
-├── (M15-M16)               # pipeline restante (PCJ ensamble + report)
+├── M15_pcj.py              # Perfil Clutch del Jugador ensamblaje scout-facing:
+│                           #   234 jugadores >=270 min x 71 cols (8 CATEs +
+│                           #   IC80 + 4-vec PCJ summary + 2 indices + posterior
+│                           #   probs + rankings + tier labels + sig flags
+│                           #   bayesianos via samples NUTS) + 4 aux tables
+│                           #   Top Cerrojo Sig: Keylor/Sommer/Neuer (3 GKs WC22)
+├── (M16)                   # report PDF por jugador (pendiente)
 ├── M05B_calibration.py     # T4.12 PSxG calibration diagnostics (curve, ECE/MCE,
 │                           #   Brier decomposition Murphy 1973, isotonic mapping)
 │                           #   WC22 holdout AUC 0.976, Brier 0.037, ECE 0.011
@@ -78,7 +84,7 @@ notebooks/
                             # para re-ejecucion granular
 ```
 
-Estado: M01-M14 ejecutados sobre los 64 partidos WC22. M15-M16 pendientes.
+Estado: M01-M15 ejecutados sobre los 64 partidos WC22. M16 pendiente.
 
 Validaciones SOTA (M05B + M12B):
 
