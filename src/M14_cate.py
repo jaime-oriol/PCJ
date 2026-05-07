@@ -107,8 +107,10 @@ CHANNELS: dict[str, tuple[str, str, str, str]] = {
     # per_shock_window de M08-M11 (PASO 2). Lo usamos directo sin recomputar.
     "ataque":  ("ataque/per_shock_window.parquet",  "score_atk_pre", "score_atk_post",
                 "score_atk_delta_relative"),
-    "defensa": ("defensa/per_shock_window.parquet", "score_def_pre", "score_def_post",
-                "score_def_delta_relative"),
+    # Canal defensa v2 SOTA: vdep_like (Toda 2022 -like) + xpress_value (Lee 2025).
+    # Captura pressing alto + bloque bajo, alineado con propuesta §Solidez Defensiva.
+    "defensa": ("defensa/per_shock_window.parquet", "score_def_v2_pre", "score_def_v2_post",
+                "score_def_v2_delta_relative"),
     "offball": ("offball/per_shock_window.parquet", "c_obso_pre",    "c_obso_post",
                 "c_obso_delta_relative"),
     "fisico":  ("fisico/per_shock_window.parquet",  "score_phys_pre","score_phys_post",

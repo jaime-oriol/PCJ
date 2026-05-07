@@ -148,7 +148,7 @@ CHANNELS = ["ataque", "defensa", "offball", "fisico"]
 SHOCK_TYPES = ["GOAL_AGAINST", "GOAL_FOR"]   # GA=0, GF=1 (M14 sort order)
 PER_MIN_PATHS = {"ataque": _ATAQUE_PM, "defensa": _DEFENSA_PM,
                  "offball": _OBSO,    "fisico": _FISICO_PM}
-PER_MIN_OUTCOL = {"ataque": "score_atk_minute", "defensa": "score_def_minute",
+PER_MIN_OUTCOL = {"ataque": "score_atk_minute", "defensa": "score_def_v2_minute",
                   "offball": "c_obso_mean",     "fisico": "score_phys"}
 
 

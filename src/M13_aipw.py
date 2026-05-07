@@ -80,7 +80,8 @@ SHOCK_TYPES     = ("GOAL_FOR", "GOAL_AGAINST")
 # Mapeo canal -> (path per_minute, outcome col, fill_value)
 CHANNELS: dict[str, tuple[str, str, float | None]] = {
     "ataque":  ("ataque/per_minute.parquet",  "score_atk_minute", 0.0),
-    "defensa": ("defensa/per_minute.parquet", "score_def_minute", 0.0),
+    # Canal defensa v2 SOTA (vdep_like + xpress_value calibrado, Lee 2025 + Toda 2022)
+    "defensa": ("defensa/per_minute.parquet", "score_def_v2_minute", 0.0),
     "offball": ("offball/per_minute.parquet", "obso_mean",        0.0),
     "fisico":  ("fisico/per_minute.parquet",  "score_phys",       None),
 }
