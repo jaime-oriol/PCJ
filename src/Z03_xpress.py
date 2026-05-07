@@ -164,6 +164,8 @@ def build_training_table(match_ids: list[int] | None = None,
             "f_is_home_ball", "f_score_diff",
             "recovery",
         ])
+        # Anadir features de tracking 25Hz
+        press = _extract_tracking_features(mid, press)
         rows.append(press)
 
     out = pl.concat(rows) if rows else pl.DataFrame()
@@ -173,11 +175,200 @@ def build_training_table(match_ids: list[int] | None = None,
     return out
 
 
-FEATURE_COLS = [
+FEATURE_COLS_EVENTS = [
     "f_press_type", "f_touch_type", "f_facing",
     "f_open_play", "f_time_norm", "f_period",
     "f_is_home_ball", "f_score_diff",
 ]
+
+# Features tracking 25Hz (Lee et al. 2025 SOTA): geometria defensor-balon-rival
+FEATURE_COLS_TRACKING = [
+    "f_dist_def_ball",          # dist defensor-balon (m)
+    "f_dist_def_carrier",       # dist defensor-portador (m)
+    "f_def_speed",              # velocidad del defensor (m/s)
+    "f_carrier_speed",          # velocidad del portador (m/s)
+    "f_dist_ball_to_goal",      # dist balon-porteria rival (m, signed por dir)
+    "f_n_def_within_5m",        # numero defensores ≤5m del balon
+    "f_n_att_within_5m",        # numero atacantes ≤5m del balon
+    "f_ball_x_norm",            # ball_x normalizado a direccion ataque
+    "f_def_ahead_of_carrier",   # 1 si defensor por delante del portador (en x_ataque)
+]
+FEATURE_COLS = FEATURE_COLS_EVENTS + FEATURE_COLS_TRACKING
+
+
+def _extract_tracking_features(match_id: int,
+                                  press_df: pl.DataFrame) -> pl.DataFrame:
+    """Lee 1 frame del tracking PFF por cada press event y extrae features
+    geometricas (Lee et al. 2025 exPress SOTA).
+
+    Mecanica:
+      1. Ball position from `ballsSmoothed`.
+      2. Defender position via jersey lookup en home/awayPlayersSmoothed.
+      3. Velocidades via diff con frame previo (~1s atras).
+      4. Direccion ataque para normalizar coords + dist_to_goal signada.
+
+    Args:
+        match_id: PFF match id.
+        press_df: cols [startTime, period, press_player_id, ...] (filtered to A/L/P).
+
+    Returns:
+        DataFrame con press_df + 9 cols `f_*` de tracking. Filas con frame
+        ausente o sin posicion del defensor → drop.
+    """
+    if press_df.height == 0:
+        return press_df
+
+    from M01_loader_pff import scan_tracking, load_metadata, load_rosters
+    from M03_preprocess import attacking_direction
+
+    md = load_metadata(match_id).row(0, named=True)
+    home_id = int(md["home_team_id"])
+    away_id = int(md["away_team_id"])
+    pitch_l = float(md.get("pitch_length") or 105.0)
+
+    # player_id -> (team_id, jersey)
+    ro = load_rosters(match_id)
+    p2tj: dict[int, tuple[int, int]] = {}
+    for r in ro.iter_rows(named=True):
+        if r["shirt_number"] is None:
+            continue
+        p2tj[int(r["player_id"])] = (int(r["team_id"]), int(r["shirt_number"]))
+
+    dirs_df = attacking_direction(match_id)
+    dir_lookup = {(int(d["team_id"]), int(d["period"])): d["direction"]
+                  for d in dirs_df.iter_rows(named=True)}
+
+    tr = scan_tracking(match_id).select([
+        "frameNum", "period", "videoTimeMs",
+        pl.col("homePlayersSmoothed").alias("home_players"),
+        pl.col("awayPlayersSmoothed").alias("away_players"),
+        pl.col("ballsSmoothed").struct.field("x").alias("ball_x"),
+        pl.col("ballsSmoothed").struct.field("y").alias("ball_y"),
+        pl.col("game_event").struct.field("player_id").cast(pl.Int64).alias("carrier_id"),
+    ]).collect().sort("videoTimeMs")
+
+    press_sorted = press_df.with_columns(
+        (pl.col("startTime") * 1000).alias("vtime_ms")
+    ).sort("vtime_ms")
+    matched = press_sorted.join_asof(
+        tr, left_on="vtime_ms", right_on="videoTimeMs", strategy="backward",
+    )
+    # Frame previo (~1s atras) para velocidades
+    matched_prev = press_sorted.with_columns(
+        (pl.col("vtime_ms") - 1000.0).alias("vtime_prev_ms")
+    ).sort("vtime_prev_ms").join_asof(
+        tr.select(["videoTimeMs",
+                    pl.col("home_players").alias("home_prev"),
+                    pl.col("away_players").alias("away_prev"),
+                    pl.col("ball_x").alias("ball_x_prev"),
+                    pl.col("ball_y").alias("ball_y_prev")]),
+        left_on="vtime_prev_ms", right_on="videoTimeMs", strategy="backward",
+    ).select(["startTime", "press_player_id", "home_prev", "away_prev",
+              "ball_x_prev", "ball_y_prev"])
+
+    df = matched.join(matched_prev, on=["startTime", "press_player_id"], how="left")
+
+    rows = []
+    for row in df.iter_rows(named=True):
+        if row["ball_x"] is None or row["press_player_id"] is None:
+            continue
+        pid = int(row["press_player_id"])
+        if pid not in p2tj:
+            continue
+        team, jersey = p2tj[pid]
+        period = int(row["period"]) if row["period"] is not None else 1
+
+        side = "home_players" if team == home_id else "away_players"
+        side_prev = "home_prev" if team == home_id else "away_prev"
+        # opponent side (carrier team)
+        opp_team = away_id if team == home_id else home_id
+        opp_side = "away_players" if team == home_id else "home_players"
+
+        def _find_pos(players, target_jersey):
+            if not players:
+                return None, None
+            for p in players:
+                if p is None or p.get("jerseyNum") is None:
+                    continue
+                if int(p["jerseyNum"]) == target_jersey:
+                    return p.get("x"), p.get("y")
+            return None, None
+
+        def_x, def_y = _find_pos(row[side], jersey)
+        if def_x is None:
+            continue
+        def_x_prev, def_y_prev = _find_pos(row[side_prev], jersey)
+        if def_x_prev is not None:
+            def_speed = float(np.hypot(def_x - def_x_prev, def_y - def_y_prev))
+        else:
+            def_speed = 0.0
+        # Carrier (best-effort)
+        carrier_id = row.get("carrier_id")
+        carrier_speed = 0.0
+        carrier_x, carrier_y = row["ball_x"], row["ball_y"]   # fallback ball pos
+        if carrier_id is not None and int(carrier_id) in p2tj:
+            ct, cj = p2tj[int(carrier_id)]
+            cside = "home_players" if ct == home_id else "away_players"
+            cside_prev = "home_prev" if ct == home_id else "away_prev"
+            cx, cy = _find_pos(row[cside], cj)
+            if cx is not None:
+                carrier_x, carrier_y = cx, cy
+                cx_prev, cy_prev = _find_pos(row[cside_prev], cj)
+                if cx_prev is not None:
+                    carrier_speed = float(np.hypot(cx - cx_prev, cy - cy_prev))
+
+        ball_x, ball_y = float(row["ball_x"]), float(row["ball_y"])
+
+        # Direccion ataque del CARRIER → goal del defensor a su espalda
+        carrier_team = away_id if team == home_id else home_id
+        car_dir = dir_lookup.get((carrier_team, period), "R")
+        car_attack_x = +pitch_l / 2 if car_dir == "R" else -pitch_l / 2
+
+        dist_def_ball    = float(np.hypot(def_x - ball_x, def_y - ball_y))
+        dist_def_carrier = float(np.hypot(def_x - carrier_x, def_y - carrier_y))
+        dist_ball_to_goal = float(abs(car_attack_x - ball_x))
+
+        # n_defenders / attackers within 5m of ball
+        all_def = row[side] or []
+        all_att = row[opp_side] or []
+        n_def_5m = 0
+        for p in all_def:
+            if p is None or p.get("x") is None:
+                continue
+            if np.hypot(p["x"] - ball_x, p["y"] - ball_y) <= 5.0:
+                n_def_5m += 1
+        n_att_5m = 0
+        for p in all_att:
+            if p is None or p.get("x") is None:
+                continue
+            if np.hypot(p["x"] - ball_x, p["y"] - ball_y) <= 5.0:
+                n_att_5m += 1
+
+        # ball_x normalizado: positivo si en direccion ataque del carrier
+        ball_x_norm = ball_x if car_dir == "R" else -ball_x
+        # def by-delante: defensor entre carrier y goal (en eje x_ataque)
+        def_x_norm = def_x if car_dir == "R" else -def_x
+        carrier_x_norm = carrier_x if car_dir == "R" else -carrier_x
+        def_ahead = int(def_x_norm > carrier_x_norm)
+
+        rows.append({
+            "startTime":             row["startTime"],
+            "press_player_id":       pid,
+            "f_dist_def_ball":       dist_def_ball,
+            "f_dist_def_carrier":    dist_def_carrier,
+            "f_def_speed":           def_speed,
+            "f_carrier_speed":       carrier_speed,
+            "f_dist_ball_to_goal":   dist_ball_to_goal,
+            "f_n_def_within_5m":     n_def_5m,
+            "f_n_att_within_5m":     n_att_5m,
+            "f_ball_x_norm":         ball_x_norm,
+            "f_def_ahead_of_carrier": def_ahead,
+        })
+
+    if not rows:
+        return press_df.head(0)
+    feats = pl.DataFrame(rows)
+    return press_df.join(feats, on=["startTime", "press_player_id"], how="left")
 
 
 # --- Train + cross-fit + isotonic calibration -----------------------------
