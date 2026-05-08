@@ -8,12 +8,14 @@ puerta clara es aleatorio dado pre-estado). M13 AIPW los usa como IV.
 Cinco tipos con umbrales pre-registrados (propuesta §1.7):
   (a) Palo/travesano       : shot.outcome in {Post, Saved to Post},
                              xg pre-shot in [0.15, 0.85]
-  (b) Offside milimetrico  : Offside event con margin <= 1.5m medido sobre
-                             StatsBomb 360 freeze_frame (linea defensiva real).
-                             Fallback proxy att_x > 110 si no hay 360.
+  (b) Offside milimetrico  : Offside event con margin <= 1.5 unidades SB
+                             (≈ 1.37m, 1 SB unit ≈ 1 yard) sobre 360
+                             freeze_frame (linea defensiva real). Fallback
+                             proxy att_x > 110 si no hay 360.
   (c) Parada PSxG alto     : outcome=Saved y (PSxG>=0.6 OR xg_baseline>=0.4)
   (d) Despeje linea gol    : outcome == Saved Off Target (marker SB directo).
-  (e) GLT no-gol           : fuera de scope (raro en WC22).
+  (e) GLT no-gol           : ball cruza linea via PFF tracking 25Hz ball.z
+                             (caso JPN-ESP famoso, raro en WC22).
 
 Acceptance (ARCHITECTURE.md): distribucion coherente con benchmarks.
   Escalado a 64 partidos: ~120-185 near-miss totales.
@@ -55,7 +57,7 @@ PSXG_SAVE_STRICT     = 0.60
 XG_SAVE_LAX          = 0.40
 XG_POST_MIN          = 0.15
 XG_POST_MAX          = 0.85
-OFFSIDE_TIGHT_METERS = 1.5     # margen X entre atacante y ultimo defensor
+OFFSIDE_TIGHT_SB_UNITS = 1.5   # margen X attacker - last defender (SB units = yards, ≈ 1.37m)
 
 
 # ===========================================================================
@@ -227,11 +229,12 @@ _OFFSIDE_SCHEMA = {
 
 
 def _offside_margin_from_ff(att_x: float, ff: list) -> float | None:
-    """Margen (metros) entre atacante y linea defensiva a partir de freeze-frame SB.
+    """Margen (SB units) entre atacante y linea defensiva via SB 360 freeze-frame.
 
     La linea defensiva = max(x) entre defensores no-keeper.
     Margin positivo = atacante por DELANTE de la linea (offsided).
-    Coords SB 120x80; 1 unidad ~ 1m. Devuelve None si no hay defensores visibles.
+    Coords SB 120x80 en yards (1 SB unit ≈ 1 yard ≈ 0.91m). Devuelve None si
+    no hay defensores visibles.
     """
     if not ff:
         return None
@@ -251,10 +254,10 @@ def _offside_margin_from_ff(att_x: float, ff: list) -> float | None:
 
 
 def _detect_offside_tight(match_ids: list[int],
-                           tight_meters: float = OFFSIDE_TIGHT_METERS
+                           tight_sb_units: float = OFFSIDE_TIGHT_SB_UNITS
                            ) -> pl.DataFrame:
-    """(b) Offside milimetrico real: margen <= tight_meters entre atacante y
-    linea defensiva (max x de no-keeper).
+    """(b) Offside milimetrico real: margen <= tight_sb_units entre atacante y
+    linea defensiva (max x de no-keeper). 1 SB unit ≈ 1 yard ≈ 0.91m.
 
     Fuente: StatsBomb 360 freeze_frames. Si falta el 360 del partido o del
     evento concreto, cae a proxy att_x > 110 y flag margin_info = NaN para
@@ -282,7 +285,7 @@ def _detect_offside_tight(match_ids: list[int],
             margin = _offside_margin_from_ff(att_x, ff) if ff else None
 
             if margin is not None:
-                is_tight = 0.0 <= margin <= tight_meters
+                is_tight = 0.0 <= margin <= tight_sb_units
             else:
                 is_tight = att_x > 110.0        # proxy fallback
 
