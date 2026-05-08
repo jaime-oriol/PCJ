@@ -47,15 +47,32 @@ if [[ "${FORCE_CLEAN:-0}" == "1" ]]; then
     rm -rf cache/vaep
 fi
 
+# Auto-deteccion de recursos: si user no setea N_WORKERS_*, usa nproc.
+# Si nvidia-smi disponible, activa GPU para CatBoost + JAX.
+N_CORES=$(nproc 2>/dev/null || echo 1)
+N_WORKERS_M10="${N_WORKERS_M10:-$N_CORES}"
+N_WORKERS_M11="${N_WORKERS_M11:-$N_CORES}"
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -qi gpu; then
+    CATBOOST_GPU="${CATBOOST_GPU:-1}"
+    JAX_PLATFORMS="${JAX_PLATFORMS:-gpu}"
+    GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1)
+else
+    CATBOOST_GPU="${CATBOOST_GPU:-0}"
+    JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+    GPU_INFO="(no GPU detected)"
+fi
+
 # Banner config
 echo ""
 echo "Pipeline config:"
 echo "  PYTHON          : $PYTHON"
+echo "  N_CORES (nproc) : $N_CORES"
+echo "  GPU             : $GPU_INFO"
 echo "  N_TRIALS_OPTUNA : $N_TRIALS"
-echo "  N_WORKERS_M10   : ${N_WORKERS_M10:-1}"
-echo "  N_WORKERS_M11   : ${N_WORKERS_M11:-1}"
-echo "  CATBOOST_GPU    : ${CATBOOST_GPU:-0}"
-echo "  JAX_PLATFORMS   : ${JAX_PLATFORMS:-cpu}"
+echo "  N_WORKERS_M10   : $N_WORKERS_M10"
+echo "  N_WORKERS_M11   : $N_WORKERS_M11"
+echo "  CATBOOST_GPU    : $CATBOOST_GPU"
+echo "  JAX_PLATFORMS   : $JAX_PLATFORMS"
 echo "  FORCE_CLEAN     : ${FORCE_CLEAN:-0}"
 echo "  SKIP_M10        : ${SKIP_M10:-0}"
 echo "  SKIP_M14        : ${SKIP_M14:-0}"
