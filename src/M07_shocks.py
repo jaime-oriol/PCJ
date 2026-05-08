@@ -74,16 +74,6 @@ OVERLAP_SECONDS = 600      # otro shock dentro de ±10 min = overlap
 #  SECCION 1 — Helpers
 # ===========================================================================
 
-def _match_end_seconds(match_id: int) -> int:
-    """Ultimo start_game_clock del partido (fin real del juego tras stoppage)."""
-    ev = load_events(match_id)
-    return int(
-        ev.select(
-            pl.col("gameEvents").struct.field("startGameClock").max()
-        ).item()
-    )
-
-
 def _period_boundaries(match_id: int) -> dict[int, tuple[int, int]]:
     """Inicio y fin (en start_game_clock seconds) de cada periodo observado."""
     ev = load_events(match_id)
@@ -214,13 +204,11 @@ def build_shocks_table(cache: bool = True,
             # Modulador continuo: minuto normalizado a [0, ~1.33] (ET=hasta 120/90)
             minute_norm = minute_goal / 90.0
 
-            # Jugadores en campo al minuto del gol
-            # minute_in/minute_out de player_minutes (en MINUTOS)
-            minute_threshold = minute_goal
+            # On-field al minuto del gol. minute_in/out de player_minutes en MINUTOS.
             on_field = pm.filter(
                 pl.col("minute_in").is_not_null() &
-                (pl.col("minute_in") <= minute_threshold) &
-                (pl.col("minute_out") >= minute_threshold)
+                (pl.col("minute_in") <= minute_goal) &
+                (pl.col("minute_out") >= minute_goal)
             )
 
             # Bloque por team: composicion del LOO downstream
@@ -363,7 +351,7 @@ def attach_team_loo(per_minute: pl.DataFrame, value_col: str,
 
     Args:
         per_minute: DataFrame con cols [match_col, player_col, period, sec_abs,
-                    value_col]. Cualquiera de M08-M11 cumple X3.
+                    value_col]. M08-M11 lo emiten con esos nombres.
         value_col:  Nombre de la col a agregar (e.g., 'score_atk_minute').
 
     Returns:
