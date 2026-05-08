@@ -29,9 +29,6 @@ from ._common import (
     DATA_PUB, clean_empty_strings, parquet_dir, write_parquet,
 )
 
-# Backward compat: alias privado del helper compartido (consumidores legacy)
-_clean_empty_strings = clean_empty_strings
-
 # -- Rutas ------------------------------------------------------------------
 
 _WYSCOUT = DATA_PUB / "wyscout"

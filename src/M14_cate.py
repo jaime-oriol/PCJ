@@ -7,8 +7,8 @@ propuesta (post-GA, post-GF, eliminacion-continuo), con jerarquia 3 niveles
 (jugador ⊂ equipo ⊂ posicion), correlacion cross-canal LKJ por dimension,
 priors informativos PFF grades, moduladores continuos del contexto del
 shock (minute, score-diff post, fase, leverage, elim_prox) y sampling
-HMC/NUTS exacto. Absorbe el M14b binario via eta_pressure[i,k] como
-pendiente individual respecto a elim_prox_z (3a dimension continua).
+HMC/NUTS exacto. eta_pressure[i,k] es la 3a eta del modelo: pendiente
+individual respecto a elim_prox_z (3a dimension continua).
 
 SOTA implementado:
 
@@ -278,7 +278,7 @@ def _model_mvbcf(player_idx, shock_idx, channel_idx,
     Los moduladores continuos absorben la heterogeneidad poblacional por
     contexto (minute, score-diff post, fase, leverage, elim_prox).
     eta_pressure es el TERCER eta — captura la respuesta INDIVIDUAL al
-    contexto de eliminacion (absorbe M14b sin trigger binario).
+    contexto de eliminacion (sin trigger binario, slope continua).
 
     shock_idx: GOAL_AGAINST=0, GOAL_FOR=1 (sorted alphabetical).
     """

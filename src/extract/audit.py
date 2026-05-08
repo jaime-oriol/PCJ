@@ -29,11 +29,9 @@ from typing import Any
 import polars as pl
 
 from ._common import (
-    DATA_PFF, DATA_PUB, PARQUET, clean_empty_strings, deep_equal,
+    DATA_PFF, DATA_PUB, PARQUET, clean_empty_strings as _clean_empty_strings,
+    deep_equal,
 )
-
-# Alias retro-compat para audit (clean_empty_strings ahora vive en _common)
-_clean_empty_strings = clean_empty_strings
 
 
 SB  = DATA_PUB / "statsbomb" / "data"

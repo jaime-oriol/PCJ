@@ -1,7 +1,8 @@
 """M12 validation suite SOTA: placebo + power + naive baseline + window sensitivity.
 
-Outputs en data/parquet/derived/did_validation/ — consumidos por M15 (power_analysis)
-y M16 paper. Complementa M12_did.py con tests robustez NO cubiertos en su pipeline.
+Outputs en data/parquet/derived/did_validation/ — consumidos por M15
+(power_analysis). Complementa M12_did.py con tests robustez NO cubiertos
+en su pipeline.
 
 Tests implementados:
 - placebo_test.parquet: permutation 1000 iter (within player-shock outcome shuffle).

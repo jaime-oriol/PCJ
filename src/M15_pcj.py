@@ -74,10 +74,11 @@ HIGH_LEVERAGE_THRESHOLD = 0.05   # M04 leverage > 0.05 = "high stress" shock
 
 
 # ----------------------------------------------------------------------------
-# Schema contract para M16 (PCJ table downstream consumer)
+# Schema contract estable de la tabla PCJ
 # ----------------------------------------------------------------------------
-# Campos requeridos para que M16 pueda generar PDFs por jugador. Si falta
-# alguno, M15 falla con mensaje claro antes de persistir.
+# Campos requeridos en pcj_table.parquet. Si falta alguno, M15 falla con
+# mensaje claro antes de persistir — protege a downstream consumers
+# (notebooks scout, exports, etc.) de schemas rotos.
 PCJ_REQUIRED_COLS: dict[str, type] = {
     # Identidad (5)
     "pff_player_id": pl.Int64, "player_name": pl.String,
@@ -128,7 +129,7 @@ PCJ_REQUIRED_COLS: dict[str, type] = {
 def validate_pcj_schema(df: pl.DataFrame) -> None:
     """Falla con mensaje claro si faltan cols requeridas o tipos no coinciden.
 
-    M16 lee este parquet y necesita estabilidad de cols/tipos. Llamada
+    Garantia de estabilidad del contrato pcj_table.parquet. Llamada
     obligatoria antes de write_parquet en main().
     """
     missing = [c for c in PCJ_REQUIRED_COLS if c not in df.columns]
@@ -997,7 +998,7 @@ def build_aux_tables(pcj: pl.DataFrame) -> dict:
 
 def main():
     pcj = build_pcj_table()
-    validate_pcj_schema(pcj)             # falla si M16 contract roto
+    validate_pcj_schema(pcj)             # falla si schema contract roto
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
     _AUX_DIR.mkdir(parents=True, exist_ok=True)
     out_path = _OUT_DIR / "pcj_table.parquet"

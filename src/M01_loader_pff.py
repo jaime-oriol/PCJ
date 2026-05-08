@@ -2,7 +2,7 @@
 M01_loader_pff - API de lectura de los parquets PFF (events, tracking, metadata, rosters).
 
 I/O puro + normalizacion de tipos + vistas derivadas (goles, disparos, subs).
-Todo lo que M02-M16 necesitan para tocar PFF sin parsear JSON ni lidiar con
+Todo lo que M02-M15 necesitan para tocar PFF sin parsear JSON ni lidiar con
 inconsistencias del proveedor.
 
 Filosofia:

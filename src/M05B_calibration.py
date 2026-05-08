@@ -6,8 +6,8 @@ Toma el modelo + calibrador entrenado por M05 y produce:
 - calibration_metrics.parquet : ECE, MCE, Brier, AUC sobre OOF + WC22 holdout
 - isotonic_curve.parquet : (raw_pred, calibrated_pred) del isotonic mapping
 
-Outputs en data/parquet/derived/psxg/calibration/
-M16 los consume para los calibration plots del paper.
+Outputs en data/parquet/derived/psxg/calibration/ — calibration plots para
+analisis de la cabeza PSxG (M05).
 """
 from __future__ import annotations
 import pickle
