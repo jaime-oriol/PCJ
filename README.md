@@ -61,24 +61,33 @@ src/
 ├── M14_cate.py             # CATE multivariate jerarquico bayesiano (numpyro
 │                           #   NUTS HMC, 4 chains, Multivariate BCF analog
 │                           #   Hu 2025): jerarquia 3 niveles player ⊂ team
-│                           #   ⊂ position + LKJCholesky cross-canal x3 +
-│                           #   priors informativos PFF grades + 3 etas
-│                           #   independientes (eta_ga, eta_gf, eta_pressure
-│                           #   slope continuo respecto a elim_prox_z) +
+│                           #   ⊂ position + LKJCholesky cross-canal x5 +
+│                           #   priors informativos PFF grades + 5 etas:
+│                           #   eta_ga (post-GA), eta_gf (post-GF),
+│                           #   eta_pressure (slope a elim_prox_z),
+│                           #   eta_ga_x_teamdir + eta_gf_x_teamdir (slope
+│                           #   individual a direccion del bloque) +
 │                           #   R-hat/ESS + PPC KS-test
 ├── M15_pcj.py              # Perfil Clutch del Jugador ensamblaje scout-facing.
-│                           #   ~234 jugadores >=270 min × ~120 cols integrando todo
-│                           #   el pipeline: 8 CATEs M14 + IC80/95 + 3 indices
-│                           #   bayesianos (Remontador, Cerrojo, Pressure Response)
+│                           #   ~234 jugadores >=270 min × ~200 cols integrando todo
+│                           #   el pipeline: 5 perspectivas CATEs M14 (GA, GF,
+│                           #   PRESSURE, GA_X_TEAMDIR, GF_X_TEAMDIR) + IC80/95 +
+│                           #   16 cells contextualizados (4 canales x 2 shocks x
+│                           #   2 directions equipo: team_attacks/team_defends) +
+│                           #   3 indices bayesianos (chasing/protecting/pressure)
 │                           #   + posterior probs P(idx>0|data) desde NUTS samples
 │                           #   + 4-vec PCJ directional + tier labels global/in-position
 │                           #   + tier_certain (Elite solo si IC80 excluye 0) + sig
 │                           #   flags duales (0.85/0.95) + acute window CATE +-5min
 │                           #   + intra-corr cross-canal per jugador + baselines
-│                           #   absolutos M08-M11 + age/height + leverage exposure
-│                           #   + nearmiss exposure + channel_credibility (M12+M13+
-│                           #   sensitivity) + power_flag (M12B). Schema contract
-│                           #   estable validado pre-write.
+│                           #   absolutos M08-M11 + age/height + leverage/nearmiss
+│                           #   exposure + channel_credibility + power_flag.
+│                           #   Schema contract estable validado pre-write.
+├── render_ficha.py         # ficha visual scout-facing por jugador. Consume
+│                           #   pcj_table.parquet y printa barras unicode +
+│                           #   frases scout (mapeo lenguaje del entrenador
+│                           #   propuesta_final.md). Uso: python -m src.render_ficha
+│                           #   <player_id|name> | --top {chasing,protecting,pressure} N
 ├── Z01_vaep.py             # building block atomic-VAEP wrapper (compute_features/
 │                           #   labels + save_models/load_models, usado por M08/M09)
 ├── Z02_pitch_control.py    # building block PPCF Spearman 2018 vectorizado (core

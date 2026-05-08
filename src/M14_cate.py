@@ -207,6 +207,35 @@ def build_delta_panel(cache: bool = True, relative: bool = True) -> pl.DataFrame
         z_cols.append(((pl.col(col).fill_null(m) - m) / s).alias(alias))
     panel = panel.with_columns(z_cols)
 
+    # team_direction_z per (shock, perspective): mide si el bloque del jugador
+    # focal se volcó al ataque (positivo) o se cerró atrás (negativo) tras el
+    # shock. Calculado desde delta_team_loo de M08 (atk) y M09 (def):
+    #   team_direction_raw = avg_dtl_atk - avg_dtl_def per (shock_id, shock_type).
+    # Captura el "patrón colectivo del bloque" sin presuponer (propuesta L43).
+    psw_atk = pl.read_parquet(
+        derived / "ataque/per_shock_window.parquet"
+    ).select(["shock_id", "shock_type", "score_atk_v2_delta_team_loo"]) \
+     .group_by(["shock_id", "shock_type"]) \
+     .agg(pl.col("score_atk_v2_delta_team_loo").mean().alias("team_atk_resp"))
+    psw_def = pl.read_parquet(
+        derived / "defensa/per_shock_window.parquet"
+    ).select(["shock_id", "shock_type", "score_def_v4_delta_team_loo"]) \
+     .group_by(["shock_id", "shock_type"]) \
+     .agg(pl.col("score_def_v4_delta_team_loo").mean().alias("team_def_resp"))
+    team_dir = psw_atk.join(
+        psw_def, on=["shock_id", "shock_type"], how="inner"
+    ).with_columns(
+        (pl.col("team_atk_resp") - pl.col("team_def_resp")).alias("td_raw")
+    )
+    m_td = float(team_dir["td_raw"].drop_nulls().mean() or 0.0)
+    s_td = float(team_dir["td_raw"].drop_nulls().std() or 1.0) or 1.0
+    team_dir = team_dir.with_columns(
+        ((pl.col("td_raw") - m_td) / s_td).alias("team_direction_z")
+    ).select(["shock_id", "shock_type", "team_direction_z"])
+    panel = panel.join(
+        team_dir, on=["shock_id", "shock_type"], how="left"
+    ).with_columns(pl.col("team_direction_z").fill_null(0.0))
+
     # Z-score within (channel, shock_type) + clip suave a [-5, +5] para
     # estabilidad NUTS (outliers fisico extremos generan tail muy gruesa que
     # explota gradientes con LKJ + jerarquia 3 niveles). Pierde <0.1% info,
@@ -256,7 +285,7 @@ def attach_pff_grades(panel: pl.DataFrame) -> pl.DataFrame:
 def _model_mvbcf(player_idx, shock_idx, channel_idx,
                   pff_grade_z,
                   minute_norm, score_diff_post_z, week_idx_norm,
-                  leverage_z, elim_prox_z,
+                  leverage_z, elim_prox_z, team_direction_z,
                   y, n_players, n_teams, n_positions, n_shock_types,
                   n_channels, player_to_team, player_to_position):
     """Modelo unificado relativo (propuesta nueva §Fase 4):
@@ -265,6 +294,7 @@ def _model_mvbcf(player_idx, shock_idx, channel_idx,
           mu_shock[s,k]
           + b_context[i,k]                       # PFF grade + team + position
           + eta[i,s,k]                           # respuesta individual a shock-type s
+          + eta_x_td[i,s,k] * team_direction_z   # pendiente per jugador × direccion
           + b_min[k] minute_norm
           + b_score[k] score_diff_post_z
           + b_phase[k] week_idx_norm
@@ -274,11 +304,19 @@ def _model_mvbcf(player_idx, shock_idx, channel_idx,
           sigma_eps[k]
       )
 
-    eta_ga, eta_gf, eta_pressure: NCP + LKJ cross-canal independiente.
-    Los moduladores continuos absorben la heterogeneidad poblacional por
-    contexto (minute, score-diff post, fase, leverage, elim_prox).
-    eta_pressure es el TERCER eta — captura la respuesta INDIVIDUAL al
-    contexto de eliminacion (sin trigger binario, slope continua).
+    Cinco etas individuales con NCP + LKJ cross-canal:
+      - eta_ga, eta_gf       : respuesta base post-shock por shock_type
+      - eta_ga_x_td, eta_gf_x_td : pendiente individual respecto a direccion
+                                    del bloque (atacar vs cerrarse) per shock_type
+      - eta_pressure         : pendiente individual respecto a elim_prox
+
+    Los moduladores continuos absorben la heterogeneidad poblacional. Los etas
+    individuales capturan la respuesta INDIVIDUAL neta de equipo/posicion.
+
+    eta_x_td es lo que distingue perfiles tipo Atleti (positivo en defensa
+    cuando equipo se cierra) vs Barça (positivo en defensa alta cuando
+    equipo presiona). team_direction_z viene precomputed desde delta_team_loo
+    de M08+M09 en build_delta_panel.
 
     shock_idx: GOAL_AGAINST=0, GOAL_FOR=1 (sorted alphabetical).
     """
@@ -286,13 +324,17 @@ def _model_mvbcf(player_idx, shock_idx, channel_idx,
     import numpyro
     import numpyro.distributions as dist
 
-    # Hyperpriors (escalas, NCP)
-    sigma_team     = numpyro.sample("sigma_team",     dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
-    sigma_position = numpyro.sample("sigma_position", dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
-    sigma_ga       = numpyro.sample("sigma_ga",       dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
-    sigma_gf       = numpyro.sample("sigma_gf",       dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
-    sigma_pressure = numpyro.sample("sigma_pressure", dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
-    sigma_eps      = numpyro.sample("sigma_eps",      dist.HalfNormal(1.0).expand([n_channels]).to_event(1))
+    # Hyperpriors (escalas, NCP). Los nuevos sigma_*_x_td usan prior mas
+    # estricto (0.3 vs 0.5) para regularizar fuerte: 2x etas extra sobre
+    # mismo N → over-parameterization si no se regulariza.
+    sigma_team        = numpyro.sample("sigma_team",        dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
+    sigma_position    = numpyro.sample("sigma_position",    dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
+    sigma_ga          = numpyro.sample("sigma_ga",          dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
+    sigma_gf          = numpyro.sample("sigma_gf",          dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
+    sigma_ga_x_td     = numpyro.sample("sigma_ga_x_td",     dist.HalfNormal(0.3).expand([n_channels]).to_event(1))
+    sigma_gf_x_td     = numpyro.sample("sigma_gf_x_td",     dist.HalfNormal(0.3).expand([n_channels]).to_event(1))
+    sigma_pressure    = numpyro.sample("sigma_pressure",    dist.HalfNormal(0.5).expand([n_channels]).to_event(1))
+    sigma_eps         = numpyro.sample("sigma_eps",         dist.HalfNormal(1.0).expand([n_channels]).to_event(1))
 
     # PFF grade coefficient por canal
     gamma = numpyro.sample("gamma", dist.Normal(0.0, 1.0).expand([n_channels]).to_event(1))
@@ -325,6 +367,18 @@ def _model_mvbcf(player_idx, shock_idx, channel_idx,
     eta_raw_gf = numpyro.sample("eta_raw_gf", dist.Normal(0, 1).expand([n_players, n_channels]).to_event(2))
     eta_gf = numpyro.deterministic("eta_gf", jnp.matmul(eta_raw_gf, L_gf.T))
 
+    # NCP eta_ga_x_td (interaccion GA × direccion equipo) + LKJ cross-canal
+    L_ga_x_td_corr = numpyro.sample("L_ga_x_td_corr", dist.LKJCholesky(n_channels, concentration=2.0))
+    L_ga_x_td = sigma_ga_x_td[:, None] * L_ga_x_td_corr
+    eta_raw_ga_x_td = numpyro.sample("eta_raw_ga_x_td", dist.Normal(0, 1).expand([n_players, n_channels]).to_event(2))
+    eta_ga_x_td = numpyro.deterministic("eta_ga_x_td", jnp.matmul(eta_raw_ga_x_td, L_ga_x_td.T))
+
+    # NCP eta_gf_x_td (interaccion GF × direccion equipo) + LKJ cross-canal
+    L_gf_x_td_corr = numpyro.sample("L_gf_x_td_corr", dist.LKJCholesky(n_channels, concentration=2.0))
+    L_gf_x_td = sigma_gf_x_td[:, None] * L_gf_x_td_corr
+    eta_raw_gf_x_td = numpyro.sample("eta_raw_gf_x_td", dist.Normal(0, 1).expand([n_players, n_channels]).to_event(2))
+    eta_gf_x_td = numpyro.deterministic("eta_gf_x_td", jnp.matmul(eta_raw_gf_x_td, L_gf_x_td.T))
+
     # NCP eta_pressure (3a dimension): respuesta individual continua a elim_prox
     L_pres_corr = numpyro.sample("L_pres_corr", dist.LKJCholesky(n_channels, concentration=2.0))
     L_pres = sigma_pressure[:, None] * L_pres_corr
@@ -333,6 +387,7 @@ def _model_mvbcf(player_idx, shock_idx, channel_idx,
 
     # eta[i, s, k]: (P, S, K) GA=0 GF=1
     eta_player = jnp.stack([eta_ga, eta_gf], axis=1)
+    eta_player_x_td = jnp.stack([eta_ga_x_td, eta_gf_x_td], axis=1)
 
     b_context = numpyro.deterministic("b_context",
         gamma[None, :] * pff_grade_z[:, None]
@@ -343,6 +398,7 @@ def _model_mvbcf(player_idx, shock_idx, channel_idx,
     pred = (mu_shock[shock_idx, channel_idx]
             + b_context[player_idx, channel_idx]
             + eta_player[player_idx, shock_idx, channel_idx]
+            + eta_player_x_td[player_idx, shock_idx, channel_idx] * team_direction_z
             + b_min[channel_idx]   * minute_norm
             + b_score[channel_idx] * score_diff_post_z
             + b_phase[channel_idx] * week_idx_norm
@@ -415,11 +471,12 @@ def fit_cate_nuts(panel: pl.DataFrame,
     week_idx_norm      = df["week_idx_norm"].fillna(0.0).values.astype(np.float32)
     leverage_z         = df["leverage_z"].fillna(0.0).values.astype(np.float32)
     elim_prox_z        = df["elim_prox_z"].fillna(0.0).values.astype(np.float32)
+    team_direction_z   = df["team_direction_z"].fillna(0.0).values.astype(np.float32)
 
     print(f"  NUTS: N={len(y)}, players={len(players)}, teams={len(teams)}, "
           f"positions={len(positions)}, shock_types={len(shock_types)}, "
           f"channels={len(channels)}")
-    print(f"  moduladores: minute, score_diff_post, week_idx, leverage, elim_prox")
+    print(f"  moduladores: minute, score_diff_post, week_idx, leverage, elim_prox, team_direction")
     print(f"  warmup={num_warmup}, samples={num_samples}, chains={num_chains}")
 
     kernel = NUTS(_model_mvbcf, target_accept_prob=0.95)
@@ -430,7 +487,7 @@ def fit_cate_nuts(panel: pl.DataFrame,
         player_idx, shock_idx, channel_idx,
         pff_grade_z_arr,
         minute_norm, score_diff_post_z, week_idx_norm,
-        leverage_z, elim_prox_z,
+        leverage_z, elim_prox_z, team_direction_z,
         y,
         len(players), len(teams), len(positions), len(shock_types), len(channels),
         player_to_team_arr, player_to_position_arr,
@@ -480,8 +537,10 @@ def compute_diagnostics(fit: dict) -> pl.DataFrame:
     # Solo params diagnosticables (escalas, correlaciones, efectos globales)
     _SKIP = frozenset({
         "eta_raw_ga", "eta_raw_gf", "eta_raw_pres",   # NCP raw — N(0,1) by design
+        "eta_raw_ga_x_td", "eta_raw_gf_x_td",          # NCP raw interaction
         "b_team_raw", "b_pos_raw",                     # NCP raw
         "eta_ga", "eta_gf", "eta_pressure",            # deterministic — derived
+        "eta_ga_x_td", "eta_gf_x_td",                  # deterministic — derived
         "b_team", "b_position",                        # deterministic — derived
         "b_context",                                   # deterministic
     })
@@ -564,6 +623,7 @@ def posterior_predictive_check(fit: dict, panel: pl.DataFrame,
     week_idx_norm_v      = df_pd["week_idx_norm"].fillna(0.0).values.astype(np.float32)
     leverage_z_v         = df_pd["leverage_z"].fillna(0.0).values.astype(np.float32)
     elim_prox_z_v        = df_pd["elim_prox_z"].fillna(0.0).values.astype(np.float32)
+    team_dir_z_v         = df_pd["team_direction_z"].fillna(0.0).values.astype(np.float32)
 
     rows = []
     for ch_n, ch_i in ch_to_idx.items():
@@ -571,9 +631,11 @@ def posterior_predictive_check(fit: dict, panel: pl.DataFrame,
             mask = (channel_idx_v == ch_i) & (shock_idx_v == sh_i)
             obs = y_obs[mask]
             eta_key = "eta_ga" if sh_i == 0 else "eta_gf"
+            eta_x_td_key = "eta_ga_x_td" if sh_i == 0 else "eta_gf_x_td"
             sims = []
             for r in draw_idx:
                 eta_s   = s[eta_key][r]                  # (P, K)
+                eta_xtd = s[eta_x_td_key][r]             # (P, K)
                 eta_p   = s["eta_pressure"][r]           # (P, K)
                 bctx    = s["b_context"][r]              # (P, K)
                 mu_s    = s["mu_shock"][r, sh_i, ch_i]
@@ -586,6 +648,7 @@ def posterior_predictive_check(fit: dict, panel: pl.DataFrame,
                 mu_obs  = (mu_s
                            + bctx[player_idx[mask], ch_i]
                            + eta_s[player_idx[mask], ch_i]
+                           + eta_xtd[player_idx[mask], ch_i] * team_dir_z_v[mask]
                            + b_min_ * minute_norm_v[mask]
                            + b_sco  * score_diff_post_z_v[mask]
                            + b_pha  * week_idx_norm_v[mask]
@@ -618,14 +681,24 @@ def posterior_predictive_check(fit: dict, panel: pl.DataFrame,
 def posterior_per_player(fit: dict) -> pl.DataFrame:
     """IC bayesianos per (player, channel, shock_type) desde eta individual.
 
-    Usa eta_ga (GOAL_AGAINST) y eta_gf (GOAL_FOR) — efecto individual
-    neto de team, position y PFF grade. Es el input directo a los indices
-    Remontador/Cerrojo y a M15.
+    5 perspectivas:
+      - GOAL_AGAINST          : eta_ga (respuesta base post-GA)
+      - GOAL_FOR              : eta_gf (respuesta base post-GF)
+      - PRESSURE              : eta_pressure (slope a elim_prox_z)
+      - GOAL_AGAINST_X_TEAMDIR: eta_ga_x_td (slope a team_direction post-GA)
+      - GOAL_FOR_X_TEAMDIR    : eta_gf_x_td (slope a team_direction post-GF)
+
+    eta_*_x_td * team_direction_z + eta_* da el escenario contextualizado:
+      eta_ga + eta_ga_x_td * (+1) = post-GA cuando equipo ataca
+      eta_ga + eta_ga_x_td * (-1) = post-GA cuando equipo se cierra
+    M15 lo desempaqueta en los 6 escenarios scout-facing.
     """
     s = fit["samples"]
-    eta_ga = s["eta_ga"]
-    eta_gf = s["eta_gf"]
-    eta_pres = s["eta_pressure"]
+    eta_ga      = s["eta_ga"]
+    eta_gf      = s["eta_gf"]
+    eta_pres    = s["eta_pressure"]
+    eta_ga_xtd  = s["eta_ga_x_td"]
+    eta_gf_xtd  = s["eta_gf_x_td"]
     n_samples, n_players, n_channels = eta_ga.shape
 
     inv_p = {v: k for k, v in fit["p_to_idx"].items()}
@@ -655,11 +728,12 @@ def posterior_per_player(fit: dict) -> pl.DataFrame:
                 })
         return rows
 
-    # PRESSURE: 3a dimension = pendiente individual respecto a elim_prox
     return pl.DataFrame(
-        _block(eta_ga,   "GOAL_AGAINST")
-        + _block(eta_gf, "GOAL_FOR")
+        _block(eta_ga,     "GOAL_AGAINST")
+        + _block(eta_gf,   "GOAL_FOR")
         + _block(eta_pres, "PRESSURE")
+        + _block(eta_ga_xtd, "GOAL_AGAINST_X_TEAMDIR")
+        + _block(eta_gf_xtd, "GOAL_FOR_X_TEAMDIR")
     )
 
 
@@ -671,9 +745,11 @@ def posterior_cross_canal_corr(fit: dict) -> pl.DataFrame:
     s = fit["samples"]
     inv_c = {v: k for k, v in fit["ch_to_idx"].items()}
     rows = []
-    for shock_name, key in [("GOAL_AGAINST", "L_ga_corr"),
-                              ("GOAL_FOR",     "L_gf_corr"),
-                              ("PRESSURE",     "L_pres_corr")]:
+    for shock_name, key in [("GOAL_AGAINST",          "L_ga_corr"),
+                              ("GOAL_FOR",            "L_gf_corr"),
+                              ("PRESSURE",            "L_pres_corr"),
+                              ("GOAL_AGAINST_X_TEAMDIR", "L_ga_x_td_corr"),
+                              ("GOAL_FOR_X_TEAMDIR",     "L_gf_x_td_corr")]:
         Ls = s[key]
         corr = np.einsum("sij,skj->sik", Ls, Ls)
         corr_mean = corr.mean(axis=0)
@@ -693,43 +769,64 @@ def posterior_cross_canal_corr(fit: dict) -> pl.DataFrame:
 # ===========================================================================
 
 def compute_indices(fit: dict) -> pl.DataFrame:
-    """Indices Remontador/Cerrojo desde eta individual (neto de team/pos/grade).
+    """Indices PCJ desde eta individual (neto de team/pos/grade).
 
-    chasing_clutch_idx  = mean(eta_ga[:,atk], eta_ga[:,off])  — GA individual
-    protecting_clutch_idx = mean(eta_gf[:,def], eta_gf[:,phys]) — GF individual
+    Indices base (sin contextualizar dirección equipo):
+      chasing_clutch_idx     = mean(eta_ga[atk] + eta_ga[off])
+      protecting_clutch_idx  = mean(eta_gf[def] + eta_gf[phys])
+      pressure_response_idx  = mean(eta_pressure across canales)
 
-    Al usar eta (no b_player), los indices reflejan respuesta INDIVIDUAL al shock,
-    descontando el efecto de equipo y posicion.
+    Indices contextualizados (eta_player + eta_x_td * team_direction_z):
+      Cada uno evaluado en team_dir = +1 (equipo ataca) y -1 (equipo defiende),
+      por canal y shock_type. Captura el "perfil tactico" del jugador:
+        atk_GF_team_attacks  : cuando marca y equipo sigue empujando, atacas?
+        atk_GF_team_defends  : cuando marca y equipo se cierra, sigues atacando?
+        def_GF_team_attacks  : cuando marca y equipo presiona alto, te metes?
+        def_GF_team_defends  : cuando marca y equipo se cierra, eres cerrojo?
+      (idem GA × atk/def/off/phys × team_attacks/team_defends → 16 cells extra)
     """
     s = fit["samples"]
-    eta_ga = s["eta_ga"]
-    eta_gf = s["eta_gf"]
-    eta_pres = s["eta_pressure"]
+    eta_ga      = s["eta_ga"]
+    eta_gf      = s["eta_gf"]
+    eta_pres    = s["eta_pressure"]
+    eta_ga_xtd  = s["eta_ga_x_td"]
+    eta_gf_xtd  = s["eta_gf_x_td"]
     ch = fit["ch_to_idx"]
     inv_p = {v: k for k, v in fit["p_to_idx"].items()}
 
-    eta_ga_mean   = eta_ga.mean(axis=0)
-    eta_gf_mean   = eta_gf.mean(axis=0)
-    eta_pres_mean = eta_pres.mean(axis=0)
+    eta_ga_mean      = eta_ga.mean(axis=0)
+    eta_gf_mean      = eta_gf.mean(axis=0)
+    eta_pres_mean    = eta_pres.mean(axis=0)
+    eta_ga_xtd_mean  = eta_ga_xtd.mean(axis=0)
+    eta_gf_xtd_mean  = eta_gf_xtd.mean(axis=0)
 
     atk_i = ch["ataque"]; off_i = ch["offball"]
     def_i = ch["defensa"]; phy_i = ch["fisico"]
 
-    rows = [
-        {
-            "pff_player_id":       inv_p[p_i],
-            # Remontador: Empuje + Off-ball relativos al bloque post-GA
-            "chasing_clutch_idx":  float((eta_ga_mean[p_i, atk_i]
-                                           + eta_ga_mean[p_i, off_i]) / 2),
-            # Cerrojo: Defensa + Fisico relativos al bloque post-GF
-            "protecting_clutch_idx": float((eta_gf_mean[p_i, def_i]
-                                            + eta_gf_mean[p_i, phy_i]) / 2),
-            # Pressure Response: media 4-canales de la pendiente individual
-            # respecto a elim_prox (3a dimension propuesta_final §Fase 5).
-            "pressure_response_idx": float(eta_pres_mean[p_i, :].mean()),
+    rows = []
+    for p_i in range(len(inv_p)):
+        # Indices base (sin contextualizar)
+        chasing  = float((eta_ga_mean[p_i, atk_i] + eta_ga_mean[p_i, off_i]) / 2)
+        prot     = float((eta_gf_mean[p_i, def_i] + eta_gf_mean[p_i, phy_i]) / 2)
+        pressure = float(eta_pres_mean[p_i, :].mean())
+
+        # Indices contextualizados (eta_player + eta_x_td * sign)
+        # ATAQUE TEAM = +1 (equipo se vuelca al ataque post-shock)
+        # DEFIENDE   = -1 (equipo se cierra atras post-shock)
+        d = {
+            "pff_player_id": inv_p[p_i],
+            "chasing_clutch_idx": chasing,
+            "protecting_clutch_idx": prot,
+            "pressure_response_idx": pressure,
         }
-        for p_i in range(len(inv_p))
-    ]
+        for sign, label in [(+1.0, "team_attacks"), (-1.0, "team_defends")]:
+            for c_name, c_i in [("atk", atk_i), ("def", def_i),
+                                  ("off", off_i), ("phys", phy_i)]:
+                d[f"clutch_{c_name}_GA_{label}"] = float(
+                    eta_ga_mean[p_i, c_i] + eta_ga_xtd_mean[p_i, c_i] * sign)
+                d[f"clutch_{c_name}_GF_{label}"] = float(
+                    eta_gf_mean[p_i, c_i] + eta_gf_xtd_mean[p_i, c_i] * sign)
+        rows.append(d)
     return pl.DataFrame(rows)
 
 
@@ -868,30 +965,38 @@ def run_smoke_test(seed: int = 0, n_matches: int = 10,
     # T1. Shapes de TODOS los sites del modelo
     # ------------------------------------------------------------------ #
     expected_shapes = {
-        "eta_ga":     (n_total, n_pl, n_ch),
-        "eta_gf":     (n_total, n_pl, n_ch),
-        "eta_pressure": (n_total, n_pl, n_ch),
-        "eta_raw_ga": (n_total, n_pl, n_ch),
-        "eta_raw_gf": (n_total, n_pl, n_ch),
-        "eta_raw_pres": (n_total, n_pl, n_ch),
-        "b_team_raw": (n_total, n_te, n_ch),
-        "b_pos_raw":  (n_total, n_po, n_ch),
-        "L_ga_corr":  (n_total, n_ch, n_ch),
-        "L_gf_corr":  (n_total, n_ch, n_ch),
-        "L_pres_corr": (n_total, n_ch, n_ch),
-        "sigma_ga":   (n_total, n_ch),
-        "sigma_gf":   (n_total, n_ch),
-        "sigma_pressure": (n_total, n_ch),
-        "sigma_team": (n_total, n_ch),
-        "sigma_position": (n_total, n_ch),
-        "sigma_eps":  (n_total, n_ch),
-        "mu_shock":   (n_total, 2, n_ch),
-        "gamma":      (n_total, n_ch),
-        "b_min":      (n_total, n_ch),
-        "b_score":    (n_total, n_ch),
-        "b_phase":    (n_total, n_ch),
-        "b_lev":      (n_total, n_ch),
-        "b_elim":     (n_total, n_ch),
+        "eta_ga":           (n_total, n_pl, n_ch),
+        "eta_gf":           (n_total, n_pl, n_ch),
+        "eta_pressure":     (n_total, n_pl, n_ch),
+        "eta_ga_x_td":      (n_total, n_pl, n_ch),
+        "eta_gf_x_td":      (n_total, n_pl, n_ch),
+        "eta_raw_ga":       (n_total, n_pl, n_ch),
+        "eta_raw_gf":       (n_total, n_pl, n_ch),
+        "eta_raw_pres":     (n_total, n_pl, n_ch),
+        "eta_raw_ga_x_td":  (n_total, n_pl, n_ch),
+        "eta_raw_gf_x_td":  (n_total, n_pl, n_ch),
+        "b_team_raw":       (n_total, n_te, n_ch),
+        "b_pos_raw":        (n_total, n_po, n_ch),
+        "L_ga_corr":        (n_total, n_ch, n_ch),
+        "L_gf_corr":        (n_total, n_ch, n_ch),
+        "L_pres_corr":      (n_total, n_ch, n_ch),
+        "L_ga_x_td_corr":   (n_total, n_ch, n_ch),
+        "L_gf_x_td_corr":   (n_total, n_ch, n_ch),
+        "sigma_ga":         (n_total, n_ch),
+        "sigma_gf":         (n_total, n_ch),
+        "sigma_ga_x_td":    (n_total, n_ch),
+        "sigma_gf_x_td":    (n_total, n_ch),
+        "sigma_pressure":   (n_total, n_ch),
+        "sigma_team":       (n_total, n_ch),
+        "sigma_position":   (n_total, n_ch),
+        "sigma_eps":        (n_total, n_ch),
+        "mu_shock":         (n_total, 2, n_ch),
+        "gamma":            (n_total, n_ch),
+        "b_min":            (n_total, n_ch),
+        "b_score":          (n_total, n_ch),
+        "b_phase":          (n_total, n_ch),
+        "b_lev":            (n_total, n_ch),
+        "b_elim":           (n_total, n_ch),
     }
     fails = []
     for name, exp in expected_shapes.items():
@@ -936,7 +1041,8 @@ def run_smoke_test(seed: int = 0, n_matches: int = 10,
     # T4. Posterior sanity: escalas en rangos razonables
     # ------------------------------------------------------------------ #
     sanity = []
-    for name in ("sigma_ga", "sigma_gf", "sigma_team", "sigma_position", "sigma_eps"):
+    for name in ("sigma_ga", "sigma_gf", "sigma_ga_x_td", "sigma_gf_x_td",
+                  "sigma_pressure", "sigma_team", "sigma_position", "sigma_eps"):
         m = float(s[name].mean())
         if not (0.001 < m < 5.0):
             sanity.append(f"{name} mean={m:.3f} fuera de (0.001, 5.0)")
@@ -969,10 +1075,10 @@ def run_smoke_test(seed: int = 0, n_matches: int = 10,
     # T6. Pipeline de extraccion completo
     # ------------------------------------------------------------------ #
     post = posterior_per_player(fit)
-    # 3 dimensiones: GOAL_AGAINST, GOAL_FOR, PRESSURE
-    assert post.height == n_pl * n_ch * 3, f"posterior shape: {post.height}"
+    # 5 perspectivas: GA, GF, PRESSURE, GA_X_TEAMDIR, GF_X_TEAMDIR
+    assert post.height == n_pl * n_ch * 5, f"posterior shape: {post.height}"
     corr = posterior_cross_canal_corr(fit)
-    assert corr.height == 3 * n_ch * n_ch, f"corr shape: {corr.height}"
+    assert corr.height == 5 * n_ch * n_ch, f"corr shape: {corr.height}"
     idx = compute_indices(fit)
     assert idx.height == n_pl, f"indices shape: {idx.height}"
     rank = compute_rankings(idx, panel)

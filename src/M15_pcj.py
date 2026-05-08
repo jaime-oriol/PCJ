@@ -123,6 +123,14 @@ PCJ_REQUIRED_COLS: dict[str, type] = {
     "protecting_clutch_idx_absolute": pl.Float64,
     "h5_chasing_tier_changed":   pl.Boolean,
     "h5_protecting_tier_changed": pl.Boolean,
+    # Escenarios contextualizados: 4 canales x 2 shocks x 2 directions = 16
+    # cells, cada uno con mean + ppos (los stats {sd,lo80,hi80} tambien estan
+    # pero no se validan aqui — se validan los principales).
+    **{f"clutch_{ch}_{sh}_{sc}_{stat}": pl.Float64
+       for ch in ("atk", "def", "off", "phys")
+       for sh in ("GOAL_AGAINST", "GOAL_FOR")
+       for sc in ("team_attacks", "team_defends")
+       for stat in ("mean", "ppos")},
 }
 
 
@@ -529,6 +537,77 @@ def _compute_absolute_indices_for_h5(panel_abs: pl.DataFrame) -> pl.DataFrame:
     ])
 
 
+def _compute_scenario_outcomes(fit: dict) -> pl.DataFrame:
+    """Per (jugador, canal, shock_type, escenario_team_dir): mean/sd/lo80/hi80
+    + p_pos del eta player + eta_x_td * sign.
+
+    Para cada sample r del posterior:
+      eta_ga + eta_ga_x_td * (+1) = post-GA cuando equipo se vuelca al ataque
+      eta_ga + eta_ga_x_td * (-1) = post-GA cuando equipo se cierra atras
+      (idem GF)
+
+    Distingue perfiles tacticos:
+      'team_attacks': cuando tu bloque sigue empujando post-shock
+      'team_defends': cuando tu bloque se cierra atras post-shock
+    Cada uno × 4 canales × 2 shock_types = 16 cells per jugador.
+
+    Output: long (player x channel x shock_type x scenario), pivoteable a wide.
+    """
+    s = fit["samples"]
+    inv_p = {v: k for k, v in fit["p_to_idx"].items()}
+    inv_c = {v: k for k, v in fit["ch_to_idx"].items()}
+    eta_ga = s["eta_ga"]; eta_gf = s["eta_gf"]
+    eta_ga_xtd = s["eta_ga_x_td"]; eta_gf_xtd = s["eta_gf_x_td"]
+    n_samples, n_players, n_channels = eta_ga.shape
+
+    rows = []
+    for shock_name, eta_base, eta_xtd in [
+        ("GOAL_AGAINST", eta_ga, eta_ga_xtd),
+        ("GOAL_FOR",     eta_gf, eta_gf_xtd),
+    ]:
+        for sign, scenario in [(+1.0, "team_attacks"), (-1.0, "team_defends")]:
+            # samples del escenario contextualizado: (n_samples, n_players, n_channels)
+            samp = eta_base + sign * eta_xtd
+            mean    = samp.mean(axis=0)
+            sd      = samp.std(axis=0)
+            lo80    = np.quantile(samp, 0.10, axis=0)
+            hi80    = np.quantile(samp, 0.90, axis=0)
+            p_pos   = (samp > 0).mean(axis=0)
+            for c_i in range(n_channels):
+                for p_i in range(n_players):
+                    rows.append(dict(
+                        pff_player_id=inv_p[p_i],
+                        channel=inv_c[c_i],
+                        shock_type=shock_name,
+                        scenario=scenario,
+                        cate_mean=float(mean[p_i, c_i]),
+                        cate_sd=float(sd[p_i, c_i]),
+                        ci_lo80=float(lo80[p_i, c_i]),
+                        ci_hi80=float(hi80[p_i, c_i]),
+                        p_positive=float(p_pos[p_i, c_i]),
+                    ))
+    return pl.DataFrame(rows)
+
+
+def _build_scenario_wide(scenarios: pl.DataFrame) -> pl.DataFrame:
+    """Pivot scenarios long → wide. 4 canales × 2 shocks × 2 escenarios × 5 stats
+    = 80 cols nuevas con prefijo `clutch_<canal>_<shock>_<scenario>_<stat>`.
+    """
+    canal_short = {"ataque": "atk", "defensa": "def", "offball": "off", "fisico": "phys"}
+    rows = []
+    for r in scenarios.iter_rows(named=True):
+        pid = r["pff_player_id"]
+        c = canal_short.get(r["channel"], r["channel"])
+        prefix = f"clutch_{c}_{r['shock_type']}_{r['scenario']}"
+        rows.append((pid, f"{prefix}_mean",  r["cate_mean"]))
+        rows.append((pid, f"{prefix}_sd",    r["cate_sd"]))
+        rows.append((pid, f"{prefix}_lo80",  r["ci_lo80"]))
+        rows.append((pid, f"{prefix}_hi80",  r["ci_hi80"]))
+        rows.append((pid, f"{prefix}_ppos",  r["p_positive"]))
+    long = pl.DataFrame(rows, schema=["pff_player_id", "key", "val"], orient="row")
+    return long.pivot("key", index="pff_player_id", values="val")
+
+
 def _compute_posterior_probs(fit: dict) -> pl.DataFrame:
     """Per jugador: P(chasing>0|data), P(protecting>0|data), P(dual>0|data).
 
@@ -780,7 +859,13 @@ def build_pcj_table() -> pl.DataFrame:
     posterior_probs = _compute_posterior_probs(m14["fit"])
     print(f"  posterior_probs: {posterior_probs.height} jugadores")
 
-    print("[M15] Construyendo CATE wide (8 canales x 4 stats)...")
+    print("[M15] Escenarios contextualizados (4 canales x 2 shocks x 2 directions)...")
+    scenarios = _compute_scenario_outcomes(m14["fit"])
+    scenarios_wide = _build_scenario_wide(scenarios)
+    print(f"  scenarios_wide: {scenarios_wide.height} jugadores, "
+          f"{scenarios_wide.width-1} cols clutch_*")
+
+    print("[M15] Construyendo CATE wide (5 perspectivas x 4 canales x 4 stats)...")
     cate_wide = _build_cate_wide(posterior)
     print(f"  cate_wide: {cate_wide.height} jugadores, {cate_wide.width} cols")
 
@@ -828,19 +913,20 @@ def build_pcj_table() -> pl.DataFrame:
 
     print("[M15] Joining + filtrando minutos minimos...")
     df = (cate_wide
-            .join(posterior_probs, on="pff_player_id", how="inner")
-            .join(meta,            on="pff_player_id", how="left")
-            .join(minutes,         on="pff_player_id", how="left")
-            .join(shocks,          on="pff_player_id", how="left")
-            .join(acute,           on="pff_player_id", how="left")
-            .join(intra,           on="pff_player_id", how="left")
-            .join(age_h,           on="pff_player_id", how="left")
-            .join(lev,             on="pff_player_id", how="left")
-            .join(nm,              on="pff_player_id", how="left")
-            .join(baselines,       on="pff_player_id", how="left")
-            .join(physical,        on="pff_player_id", how="left")
-            .join(pressure,        on="pff_player_id", how="left")
-            .join(abs_idx,         on="pff_player_id", how="left"))
+            .join(posterior_probs,  on="pff_player_id", how="inner")
+            .join(scenarios_wide,   on="pff_player_id", how="left")
+            .join(meta,             on="pff_player_id", how="left")
+            .join(minutes,          on="pff_player_id", how="left")
+            .join(shocks,           on="pff_player_id", how="left")
+            .join(acute,            on="pff_player_id", how="left")
+            .join(intra,            on="pff_player_id", how="left")
+            .join(age_h,            on="pff_player_id", how="left")
+            .join(lev,              on="pff_player_id", how="left")
+            .join(nm,               on="pff_player_id", how="left")
+            .join(baselines,        on="pff_player_id", how="left")
+            .join(physical,         on="pff_player_id", how="left")
+            .join(pressure,         on="pff_player_id", how="left")
+            .join(abs_idx,          on="pff_player_id", how="left"))
     n_total = df.height
     df = df.filter(pl.col("minutes_played") >= MIN_MINUTES)
     print(f"  {df.height}/{n_total} jugadores >={MIN_MINUTES} min")
@@ -931,14 +1017,15 @@ def build_pcj_table() -> pl.DataFrame:
              "chasing_clutch_idx_absolute", "protecting_clutch_idx_absolute",
              "tier_chasing_global_absolute", "tier_protecting_global_absolute",
              "h5_chasing_tier_changed", "h5_protecting_tier_changed"]
-    cate_cols = sorted([c for c in df.columns if c.startswith("cate_")])
-    acute_cols = sorted([c for c in df.columns if c.startswith("acute_")])
-    base_cols = sorted([c for c in df.columns if c.startswith("baseline_")])
-    cred_cols = sorted([c for c in df.columns if c.startswith("cred_")])
-    power_cols = sorted([c for c in df.columns if c.startswith("power_")])
-    pct_cols = [c for c in df.columns if c.startswith("pct_")]
-    cols = ([c for c in front if c in df.columns] + cate_cols + acute_cols +
-            base_cols + cred_cols + power_cols + pct_cols)
+    cate_cols     = sorted([c for c in df.columns if c.startswith("cate_")])
+    clutch_cols   = sorted([c for c in df.columns if c.startswith("clutch_")])
+    acute_cols    = sorted([c for c in df.columns if c.startswith("acute_")])
+    base_cols     = sorted([c for c in df.columns if c.startswith("baseline_")])
+    cred_cols     = sorted([c for c in df.columns if c.startswith("cred_")])
+    power_cols    = sorted([c for c in df.columns if c.startswith("power_")])
+    pct_cols      = [c for c in df.columns if c.startswith("pct_")]
+    cols = ([c for c in front if c in df.columns] + cate_cols + clutch_cols +
+            acute_cols + base_cols + cred_cols + power_cols + pct_cols)
     cols += [c for c in df.columns if c not in cols]
     df = df.select(cols)
     return df
