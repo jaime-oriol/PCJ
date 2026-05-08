@@ -33,7 +33,7 @@ Implementacion numpyro multivariate COMPLETA:
     → indices Remontador/Cerrojo desde eta individual neto de equipo/posicion
   - Cross-canal correlation LKJ independiente por shock type
   - Priors informativos PFF_grade · gamma_k (Gomes-Mendes-Neves)
-  - target_accept_prob=0.9 para topologia LKJ
+  - target_accept_prob=0.95 para topologia LKJ + jerarquia 3 niveles
   - R-hat < 1.05 + ESS_bulk > 400 verificado
   - Smoke test 2-chain × 100 iter antes del run completo
 
@@ -103,14 +103,13 @@ _PFF_GRADES = _REPO / "data" / "parquet" / "derived" / "preprocess" / "pff_grade
 
 CHANNELS: dict[str, tuple[str, str, str, str]] = {
     # (path, col_pre_abs, col_post_abs, col_delta_relative).
-    # delta_relative ya viene computed via attach_team_loo de M07 en los
-    # per_shock_window de M08-M11 (PASO 2). Lo usamos directo sin recomputar.
-    # Canal ataque v2 SOTA: atomic-VAEP (Decroos 2020) + un-xPass (Robberechts 2023).
+    # delta_relative viene precomputed por attach_team_loo de M07 en los
+    # per_shock_window de M08-M11 — usamos directo sin recomputar.
+    # Canal ataque SOTA: atomic-VAEP (Decroos 2020) + un-xPass (Robberechts 2023).
     "ataque":  ("ataque/per_shock_window.parquet", "score_atk_v2_pre", "score_atk_v2_post",
                 "score_atk_v2_delta_relative"),
-    # Canal defensa v4 SOTA TOP REAL FULL: vdep_strict (Toda 2022) + xpress
-    # (Lee 2025 tracking 25Hz) + maejima (Maejima 2024 nearest-defender
-    # frame-level via tracking). Tres componentes complementarios.
+    # Canal defensa SOTA: vdep_strict (Toda 2022) + xpress (Lee 2025 tracking
+    # 25Hz) + maejima (Maejima 2024 nearest-defender frame-level).
     "defensa": ("defensa/per_shock_window.parquet", "score_def_v4_pre", "score_def_v4_post",
                 "score_def_v4_delta_relative"),
     "offball": ("offball/per_shock_window.parquet", "c_obso_pre",    "c_obso_post",
@@ -176,7 +175,7 @@ def build_delta_panel(cache: bool = True, relative: bool = True) -> pl.DataFrame
         rows.append(df)
     panel = pl.concat(rows)
 
-    # Anadir context + moduladores continuos desde shocks_table (PASO 1)
+    # Anadir context + moduladores continuos desde shocks_table (M07)
     shocks = pl.read_parquet(derived / "shocks/shocks_table.parquet").select([
         pl.col("match_id").alias("pff_match_id"),
         "shock_id",
@@ -185,7 +184,7 @@ def build_delta_panel(cache: bool = True, relative: bool = True) -> pl.DataFrame
         pl.col("player_team_id").alias("pff_team_id"),
         "stage",
         "minute",
-        # Moduladores continuos (propuesta §Fase 4)
+        # Moduladores continuos del contexto del shock
         "minute_norm",                       # minute / 90
         "score_diff_post",                   # marcador post-shock (player-pov)
         "week_idx_norm",                     # fase del torneo continua
@@ -410,7 +409,7 @@ def fit_cate_nuts(panel: pl.DataFrame,
     channel_idx = df["channel"].map(ch_to_idx).values.astype(np.int32)
     y = df["delta_z"].values.astype(np.float32)
 
-    # Moduladores continuos (PASO 1 + PASO 5)
+    # Moduladores continuos del contexto (M07 shocks_table) z-scored en panel
     minute_norm        = df["minute_norm"].fillna(0.0).values.astype(np.float32)
     score_diff_post_z  = df["score_diff_post_z"].fillna(0.0).values.astype(np.float32)
     week_idx_norm      = df["week_idx_norm"].fillna(0.0).values.astype(np.float32)
