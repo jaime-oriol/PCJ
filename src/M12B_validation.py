@@ -1,15 +1,22 @@
 """M12 validation suite SOTA: placebo + power + naive baseline + window sensitivity.
 
-Outputs en data/parquet/derived/did_validation/ — referenciados desde M16 paper.
+Outputs en data/parquet/derived/did_validation/ — consumidos por M15 (power_analysis)
+y M16 paper. Complementa M12_did.py con tests robustez NO cubiertos en su pipeline.
 
 Tests implementados:
-- T2.4 placebo_test.parquet: permutation 1000 iter (within player-shock outcome shuffle)
-  bajo H0 los pre/post son intercambiables. Devuelve p-empírico, z-score, IC95% null.
-- T2.5 power_analysis.parquet: bootstrap MDE@80%, effective_n via ICC-correction,
+- placebo_test.parquet: permutation 1000 iter (within player-shock outcome shuffle).
+  Bajo H0 los pre/post son intercambiables. Devuelve p-empirico, z-score, IC95% null.
+- power_analysis.parquet: bootstrap MDE@80%, effective_n via ICC-correction,
   posterior power para el real_ate observado.
-- T2.6 baseline_naive.parquet: post-pre simple (within-player) vs M12 DiD ATE,
-  z-test de diferencia. Magnitud relativa demuestra valor de la corrección DiD.
-- T2.7 window_sensitivity.parquet: re-estima ATE con ventanas ±5/±10/±15 minutos.
+- baseline_naive.parquet: post-pre simple (within-player) vs M12 DiD ATE, z-test
+  de diferencia. Magnitud relativa demuestra valor de la correccion DiD.
+- window_sensitivity.parquet: re-estima ATE con ventanas +-3/5/7/10/15 minutos.
+- stage_stratified.parquet: ATE separado por stage (groups vs ko).
+
+Lee M12 panels (`panel_{ch}.parquet`) que ya traen el outcome SOTA canonico
+(score_atk_v2 + un-xPass; score_def_v4 = vdep_strict + xpress + maejima;
+c_obso_mean; score_phys). Para window_sensitivity construye panel propio
+desde `per_minute.parquet` con los mismos outcome cols SOTA.
 
 Uso:
     python M12B_validation.py [overwrite]
@@ -33,12 +40,13 @@ N_PERM = 1000
 N_BOOT = 1000
 SEED = 42
 
-# Outcome col por canal (per_minute)
+# Outcome col SOTA por canal (per_minute) — DEBE coincidir con M12.CHANNELS
+# para que window_sensitivity sea sensitivity coherente del ATE canonico.
 _OUTCOME_COL = {
-    "ataque":  "score_atk_minute",
-    "defensa": "score_def_minute",
-    "offball": "c_obso_mean",
-    "fisico":  "score_phys",
+    "ataque":  "score_atk_v2_minute",   # atomic-VAEP + un-xPass
+    "defensa": "score_def_v4_minute",   # vdep_strict + xpress + maejima
+    "offball": "c_obso_mean",            # counterfactual Teranishi 2022
+    "fisico":  "score_phys",             # residual z-score multivariate
 }
 _PER_MIN_DIR = _REPO / "data" / "parquet" / "derived"
 
@@ -76,7 +84,7 @@ def _within_ate(diffs: np.ndarray) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# T2.6 Baseline naive vs M12 DiD
+# Baseline naive vs M12 DiD
 # ----------------------------------------------------------------------------
 def baseline_naive() -> pl.DataFrame:
     rows = []
@@ -112,12 +120,12 @@ def baseline_naive() -> pl.DataFrame:
             .alias("ratio_did_naive"),
     ])
     out.write_parquet(_OUT_DIR / "baseline_naive.parquet")
-    print(f"[T2.6] Saved baseline_naive.parquet ({out.height} rows)")
+    print(f"[naive] Saved baseline_naive.parquet ({out.height} rows)")
     return out
 
 
 # ----------------------------------------------------------------------------
-# T2.4 Placebo test (Fisher exact via within-series permutation)
+# Placebo test (Fisher exact via within-series permutation)
 # ----------------------------------------------------------------------------
 def placebo_test(n_perm: int = N_PERM) -> pl.DataFrame:
     rng = np.random.default_rng(SEED)
@@ -189,13 +197,13 @@ def placebo_test(n_perm: int = N_PERM) -> pl.DataFrame:
             ))
     out = pl.DataFrame(rows)
     out.write_parquet(_OUT_DIR / "placebo_test.parquet")
-    print(f"[T2.4] Saved placebo_test.parquet ({out.height} rows, "
+    print(f"[placebo] Saved placebo_test.parquet ({out.height} rows, "
           f"n_perm={n_perm})")
     return out
 
 
 # ----------------------------------------------------------------------------
-# T2.5 Power analysis (bootstrap MDE + effective_n + observed power)
+# Power analysis (bootstrap MDE + effective_n + observed power)
 # ----------------------------------------------------------------------------
 def _icc_one_way(diffs: np.ndarray, cluster_ids: np.ndarray) -> float:
     """ICC one-way ANOVA: ratio of between-cluster variance to total."""
@@ -265,13 +273,13 @@ def power_analysis(n_boot: int = N_BOOT) -> pl.DataFrame:
             ))
     out = pl.DataFrame(rows)
     out.write_parquet(_OUT_DIR / "power_analysis.parquet")
-    print(f"[T2.5] Saved power_analysis.parquet ({out.height} rows, "
+    print(f"[power] Saved power_analysis.parquet ({out.height} rows, "
           f"n_boot={n_boot})")
     return out
 
 
 # ----------------------------------------------------------------------------
-# T2.7 Window sensitivity ±3/5/7/10/15 min con panel extendido desde per_minute
+# Window sensitivity ±3/5/7/10/15 min con panel extendido desde per_minute
 # ----------------------------------------------------------------------------
 def _build_extended_window_panel(channel: str, window: int) -> pl.DataFrame:
     """Reconstruye panel con ventana arbitraria desde per_minute + shocks_table.
@@ -326,7 +334,7 @@ def window_sensitivity() -> pl.DataFrame:
                                  **info))
     out = pl.DataFrame(rows)
     out.write_parquet(_OUT_DIR / "window_sensitivity.parquet")
-    print(f"[T2.7] Saved window_sensitivity.parquet ({out.height} rows; "
+    print(f"[window] Saved window_sensitivity.parquet ({out.height} rows; "
           f"windows {windows})")
     return out
 
@@ -371,12 +379,12 @@ def add_multiple_test_correction() -> pl.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# T2.8 Stage-stratified ATE (groups vs KO)
+# Stage-stratified ATE (groups vs KO)
 # ----------------------------------------------------------------------------
 def stage_stratified_ate() -> pl.DataFrame:
     """Estima ATE separado por stage (groups vs KO).
 
-    Hipótesis: shocks en KO tienen efecto mayor por mayor leverage (eliminación).
+    Hipotesis: shocks en KO tienen efecto mayor por mayor leverage (eliminacion).
     """
     # Cargar shocks_table con stage
     sh = pl.read_parquet(_REPO / "data" / "parquet" / "derived" / "shocks" /
@@ -401,7 +409,7 @@ def stage_stratified_ate() -> pl.DataFrame:
                                  **info))
     out = pl.DataFrame(rows)
     out.write_parquet(_OUT_DIR / "stage_stratified.parquet")
-    print(f"[T2.8] Saved stage_stratified.parquet ({out.height} rows)")
+    print(f"[stage] Saved stage_stratified.parquet ({out.height} rows)")
     return out
 
 

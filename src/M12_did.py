@@ -27,8 +27,10 @@ Sun-Abraham producen estimaciones equivalentes a dCDH bajo los mismos
 supuestos identificadores. Goodman-Bacon decomposition es vacuo aqui (no hay
 late-vs-early-treated comparisons porque el tratamiento es instantaneo).
 
-Cluster errors: doble (player + match) via Cameron-Gelbach-Miller 2011 implem
-`pyfixest` CRV1.
+Cluster errors: single CRV1 sobre pff_player_id via `pyfixest`. Cluster
+solo a nivel jugador es robusto y conservador para nuestro panel: el
+tratamiento es player-level, los shocks ocurren a tasas distintas por
+jugador, y el N de matches (64) es bajo para clustering bidimensional.
 
 Outputs (data/parquet/derived/did/):
   panel_event_study.parquet     (player, shock, relative_min, channel, outcome)
@@ -82,15 +84,16 @@ HONEST_M_VALUES     = (0.5, 1.0, 2.0) # Rambachan-Roth M restrictions
 #                   (ese minuto se excluye del estimador, NO se imputa 0,
 #                   porque score_phys es z-score residualizado y 0 != "ausencia").
 CHANNELS: dict[str, tuple[str, str, float | None]] = {
-    # Canal ataque v2 SOTA: atomic-VAEP (Decroos 2020) + un-xPass (Robberechts 2023).
+    # Canal ataque SOTA: atomic-VAEP (Decroos 2020) + un-xPass (Robberechts 2023).
     "ataque":  ("ataque/per_minute.parquet",  "score_atk_v2_minute", 0.0),
-    # Canal defensa v2 SOTA (vdep_like + xpress_value calibrado, Lee 2025 + Toda 2022)
-    # Canal defensa v4 SOTA TOP REAL: vdep_strict (Toda 2022) + xpress
-    # (Lee 2025 tracking 25Hz) + maejima (Maejima 2024 nearest-defender).
+    # Canal defensa SOTA: vdep_strict (Toda 2022 cabeza dedicada
+    # P(recovery)-C*P(attacked)) + xpress (Lee 2025 tracking 25Hz) +
+    # maejima (Maejima 2024 nearest-defender frame-level).
     "defensa": ("defensa/per_minute.parquet", "score_def_v4_minute", 0.0),
-    # c_obso_mean (counterfactual Teranishi 2022) — raw OBSO descartado tras
-    # validacion T1.2: raw -0.21 vs c_obso +0.30 con PFF off grades.
-    # null cuando atacking_frames=0 → fill 0 (jugador no atacaba ese minuto)
+    # c_obso_mean (counterfactual Teranishi 2022). Raw OBSO descartado:
+    # validacion empirica vs PFF off grades dio raw -0.21 (signo invertido!)
+    # mientras c_obso +0.30 — el contrafactual aisla decision de movimiento.
+    # null cuando attacking_frames=0 → fill 0 (jugador no atacaba ese minuto).
     "offball": ("offball/per_minute.parquet", "c_obso_mean",      0.0),
     "fisico":  ("fisico/per_minute.parquet",  "score_phys",       None),
 }
@@ -148,7 +151,7 @@ def build_event_study_panel(channel: str,
         pl.col("player_id").alias("pff_player_id"),
         pl.col("period").alias("shock_period"),
         "position_group",
-        "stage", "minute",                   # T1.3 + para join leverage M04
+        "stage", "minute",                   # stage para FE KO/groups + minute para join leverage M04
     ])
 
     # Anadir leverage M04 al shock-level (1 valor per shock-minute)
@@ -370,7 +373,8 @@ def estimate_ate_with_controls(panel: pl.DataFrame,
                 + γ · Post_τ · leverage_z + ε_iτs
 
     Captura heterogeneidad ATE por:
-      - stage (KO vs groups): T2.8 demostro fisico-GA KO 4× magnitude
+      - stage (KO vs groups): el efecto fisico-GA en KO es ~4x la magnitud
+        de groups (validado empiricamente sobre el panel WC22).
       - leverage del shock (continuous): high-leverage shocks mas informativos
 
     Reporta beta (ATE base) + delta (ATE incremento KO) + gamma (ATE per
@@ -795,7 +799,7 @@ if __name__ == "__main__":
           f"mean={rel_diff.mean():.3f}")
     assert rel_diff.max() < 0.5, ("FE y BJS divergen mas de 0.5 SE — algo "
                                     "esta mal con la implementacion")
-    print("  ✓ FE ≈ BJS (validacion estimador convergente para tratamiento "
+    print("  OK FE ≈ BJS (validacion estimador convergente para tratamiento "
           "instantaneo)")
 
     # Schema final: filas esperadas
@@ -817,4 +821,4 @@ if __name__ == "__main__":
     assert es.height == 4 * 2 * len(RELATIVE_BINS)
     assert h.height == 8 * len(HONEST_M_VALUES)
     assert d.height == 8
-    print("  ✓ TODOS los schemas correctos")
+    print("  OK TODOS los schemas correctos")
