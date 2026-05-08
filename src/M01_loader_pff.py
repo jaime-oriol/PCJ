@@ -181,7 +181,9 @@ def list_goals(match_id: int | None = None) -> pl.DataFrame:
     Captura goles deliberados E involuntarios (pases/despejes/rebotes que
     acaban en gol tambien rellenan los campos del shot, ver EVENT_DATA_SPEC §4.2).
     NO filtra nada — expone los crudos con flags para que M03/M07 decida:
-      - disallowed : True si el evento fue anulado (VAR).
+      - disallowed : True si el shot O la posesion fueron anulados (VAR).
+                     OR de possessionEvents.nonEvent (shot anulado) y
+                     gameEvents.initialNonEvent (posesion entera anulada).
       - shootout   : True si es penal de tanda (period==4 & start_game_clock>7200).
       - setpiece_type : 'P' para penaltis (tanda o en juego).
 
@@ -196,7 +198,11 @@ def list_goals(match_id: int | None = None) -> pl.DataFrame:
         pl.col("possessionEvents").struct.field("keeperPlayerName").alias("keeper_name"),
         pl.col("possessionEvents").struct.field("bodyType").alias("body_part"),
         pl.col("gameEvents").struct.field("setpieceType").alias("setpiece_type"),
-        pl.col("gameEvents").struct.field("initialNonEvent").alias("disallowed"),
+        # disallowed = OR de los dos flags PFF de anulacion (cubre tanto
+        # shot-anulado como posesion-entera-anulada por VAR).
+        (pl.col("possessionEvents").struct.field("nonEvent").fill_null(False)
+         | pl.col("gameEvents").struct.field("initialNonEvent").fill_null(False))
+            .alias("disallowed"),
     ]).with_columns(
         ((pl.col("period") == 4) & (pl.col("start_game_clock") > 7200)).alias("shootout"),
     )
