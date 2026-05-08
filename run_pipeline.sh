@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# run_pipeline.sh - Ejecuta el pipeline E2E completo en orden DAG.
+# run_pipeline.sh - Pipeline E2E COMPLETO al maximo (todos Optuna trials,
+# SVI steps, NUTS samples) con paralelizacion agresiva CPU + GPU opcional.
 #
-# Diseño: cada etapa = 1 modulo Python invocado con su `compute_all`.
-# Etapas independientes corren en paralelo (Z03||Z04||Z05||Z06).
-# Cada etapa loguea a logs/<etapa>.log y aborta el pipeline si falla.
+# Tiempo objetivo en RunPod RTX 4090 (16 cores + 24GB GPU): ~90-120 min.
+# Tiempo en CPU 16 cores sin GPU: ~3-4h.
+# Tiempo CPU serial (sin paralelizar): ~5-7h.
 #
-# Uso:
-#   ./run_pipeline.sh                  # corrida completa
-#   FORCE_CLEAN=1 ./run_pipeline.sh    # borra derived/* antes
-#   SKIP_M10=1 ./run_pipeline.sh       # salta M10 (~4-5h, debug rapido)
-#   SMOKE=1 ./run_pipeline.sh          # smoke E2E con N reducidos
+# Variables de entorno relevantes:
+#   PYTHON           : binario python (default: python)
+#   N_WORKERS_M10    : workers paralelos M10 OBSO (recomendado: nproc, default 1)
+#   N_WORKERS_M11    : workers paralelos M11 raw  (recomendado: nproc, default 1)
+#   CATBOOST_GPU     : =1 → CatBoost en GPU (requiere catboost+CUDA build)
+#   N_TRIALS_OPTUNA  : trials Optuna (default 30 — al MAX para Z03/Z04/Z06/M08;
+#                                       M05 tiene su propio default 60)
+#   FORCE_CLEAN      : =1 borra derived/* antes
+#   SKIP_M10         : =1 salta M10 (debug rapido)
+#   SKIP_M14         : =1 salta M14 NUTS
 #
-# Variables de entorno opcionales:
-#   PYTHON           : binario python a usar (default: python)
-#   N_TRIALS_OPTUNA  : trials Optuna global (default: 30; smoke=5)
-#   FORCE_CLEAN      : si =1 borra data/parquet/derived/* antes
-#   SKIP_M10         : si =1 salta M10 (la etapa más cara, ~4-5h)
-#   SKIP_M14         : si =1 salta M14 (NUTS HMC ~25min)
-#   SMOKE            : si =1 reduce trials/steps para smoke rapido
-#
-# Estrategia de coste para RunPod $3-5:
-#   - Pod CPU 16-32 cores ($0.10-0.20/h) > GPU para este pipeline (M14 NUTS
-#     en CPU multi-chain es lo único GPU-acelerable, ~25min CPU vs ~5min GPU).
-#   - Total estimado ~5-7h en CPU pod 16 cores.
-#   - El cuello es M10 OBSO 25Hz × 64 partidos (~4-5h).
+# RECOMENDACION RUNPOD para 2h flujo TOP:
+#   Pod: RTX 4090 (24GB) + 16 cores + 64GB RAM (~$0.34-0.50/h)
+#   Lanzar:
+#     export N_WORKERS_M10=16 N_WORKERS_M11=16 CATBOOST_GPU=1
+#     export JAX_PLATFORMS=gpu     # para M14 NUTS GPU
+#     ./run_pipeline.sh
+#   Coste estimado: 2h × $0.50 = $1.00.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -46,6 +46,21 @@ if [[ "${FORCE_CLEAN:-0}" == "1" ]]; then
     rm -rf "$DERIVED"/*
     rm -rf cache/vaep
 fi
+
+# Banner config
+echo ""
+echo "Pipeline config:"
+echo "  PYTHON          : $PYTHON"
+echo "  N_TRIALS_OPTUNA : $N_TRIALS"
+echo "  N_WORKERS_M10   : ${N_WORKERS_M10:-1}"
+echo "  N_WORKERS_M11   : ${N_WORKERS_M11:-1}"
+echo "  CATBOOST_GPU    : ${CATBOOST_GPU:-0}"
+echo "  JAX_PLATFORMS   : ${JAX_PLATFORMS:-cpu}"
+echo "  FORCE_CLEAN     : ${FORCE_CLEAN:-0}"
+echo "  SKIP_M10        : ${SKIP_M10:-0}"
+echo "  SKIP_M14        : ${SKIP_M14:-0}"
+echo ""
+export N_WORKERS_M10 N_WORKERS_M11 CATBOOST_GPU JAX_PLATFORMS
 
 # ------------------------------------------------------------------------
 # Helper: ejecuta una etapa con log + timing + error check.

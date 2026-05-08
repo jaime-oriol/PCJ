@@ -454,26 +454,69 @@ def compute_obso_match(match_id: int, xg_grid: np.ndarray,
 #  SECCION 4 — Aggregate 64 matches + per-shock-window
 # ===========================================================================
 
-def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
-    """Agrega OBSO + C-OBSO sobre los 64 partidos WC22."""
+def _compute_obso_match_safe(args: tuple) -> pl.DataFrame | None:
+    """Wrapper top-level para multiprocessing.Pool (necesita ser pickleable).
+
+    Cada worker procesa 1 partido completo (PPCF Z02 25Hz). Pico RAM por
+    worker ~0.5-1 GB. Con N_WORKERS=16 sobre 64 partidos, ~4 batches,
+    ~12-15 min total (vs ~5h serial).
+    """
+    mid, xg_grid = args
+    try:
+        return compute_obso_match(mid, xg_grid)
+    except Exception as e:
+        print(f"  skip {mid}: {e}", flush=True)
+        return None
+
+
+def aggregate_per_player_minute(cache: bool = True,
+                                  n_workers: int | None = None) -> pl.DataFrame:
+    """Agrega OBSO + C-OBSO sobre los 64 partidos WC22.
+
+    n_workers paraleliza partidos (multiprocessing.Pool). Default lee env
+    var `N_WORKERS_M10` (1 = serial). En CPU pod 16-32 cores baja de ~5h
+    a ~12-15 min. Cada worker carga su tracking + computa PPCF Z02
+    independientemente, sin shared state.
+    """
     cache_path = _DERIVED / "per_minute.parquet"
     if cache and cache_path.exists():
         return pl.read_parquet(cache_path)
 
-    import time
+    import os, time
+    if n_workers is None:
+        n_workers = int(os.environ.get("N_WORKERS_M10", "1"))
+    n_workers = max(1, n_workers)
     xg_grid = build_xg_grid(cache=True)
-    dfs = []
+    mids = list_event_match_ids()
     t0 = time.time()
-    for i, mid in enumerate(list_event_match_ids()):
-        t_match = time.time()
-        try:
-            dfs.append(compute_obso_match(mid, xg_grid))
-        except Exception as e:
-            print(f"  skip {mid}: {e}")
-        elapsed = time.time() - t_match
-        if (i+1) % 5 == 0 or elapsed > 60:
-            print(f"  {i+1}/64 en {time.time()-t0:.0f}s "
-                  f"(last match {elapsed:.0f}s)", flush=True)
+    dfs: list[pl.DataFrame] = []
+
+    if n_workers == 1:
+        for i, mid in enumerate(mids):
+            t_m = time.time()
+            try:
+                dfs.append(compute_obso_match(mid, xg_grid))
+            except Exception as e:
+                print(f"  skip {mid}: {e}", flush=True)
+            elapsed = time.time() - t_m
+            if (i+1) % 5 == 0 or elapsed > 60:
+                print(f"  {i+1}/{len(mids)} en {time.time()-t0:.0f}s "
+                      f"(last {elapsed:.0f}s)", flush=True)
+    else:
+        from multiprocessing import Pool
+        print(f"  M10 paralelo: {n_workers} workers x {len(mids)} matches", flush=True)
+        with Pool(processes=n_workers) as pool:
+            args = [(mid, xg_grid) for mid in mids]
+            for i, res in enumerate(pool.imap_unordered(
+                    _compute_obso_match_safe, args, chunksize=1)):
+                if res is not None:
+                    dfs.append(res)
+                if (i+1) % 8 == 0:
+                    print(f"  {i+1}/{len(mids)} done en {time.time()-t0:.0f}s",
+                          flush=True)
+        print(f"  M10 paralelo total: {time.time()-t0:.0f}s", flush=True)
+
+    dfs = [d for d in dfs if d is not None and d.height > 0]
     out = pl.concat(dfs) if dfs else pl.DataFrame()
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)

@@ -521,24 +521,55 @@ def _phys_metrics_per_minute(match_id: int) -> pl.DataFrame:
                       "period", "minute_in_period"])
 
 
-def build_raw_per_minute(cache: bool = True, overwrite: bool = False) -> pl.DataFrame:
-    """Aplica _phys_metrics_per_minute a los 64 partidos WC22."""
+def _phys_metrics_safe(mid: int) -> pl.DataFrame | None:
+    """Wrapper top-level para multiprocessing.Pool."""
+    try:
+        return _phys_metrics_per_minute(mid)
+    except Exception as e:
+        print(f"  skip {mid}: {e}", flush=True)
+        return None
+
+
+def build_raw_per_minute(cache: bool = True, overwrite: bool = False,
+                          n_workers: int | None = None) -> pl.DataFrame:
+    """Aplica _phys_metrics_per_minute a los 64 partidos WC22.
+
+    n_workers paraleliza partidos. Default lee env `N_WORKERS_M11` (1 = serial).
+    """
     cache_path = _DERIVED / "raw_per_minute.parquet"
     if cache and cache_path.exists() and not overwrite:
         return pl.read_parquet(cache_path)
 
-    import time
-    dfs = []
-    t0 = time.time()
+    import os, time
+    if n_workers is None:
+        n_workers = int(os.environ.get("N_WORKERS_M11", "1"))
+    n_workers = max(1, n_workers)
     mids = list_event_match_ids()
-    for i, mid in enumerate(mids):
-        try:
-            dfs.append(_phys_metrics_per_minute(mid))
-        except Exception as e:
-            print(f"  skip {mid}: {e}")
-        if (i + 1) % 10 == 0:
-            print(f"  {i+1}/{len(mids)} en {time.time()-t0:.1f}s", flush=True)
+    t0 = time.time()
+    dfs: list[pl.DataFrame] = []
 
+    if n_workers == 1:
+        for i, mid in enumerate(mids):
+            try:
+                dfs.append(_phys_metrics_per_minute(mid))
+            except Exception as e:
+                print(f"  skip {mid}: {e}")
+            if (i + 1) % 10 == 0:
+                print(f"  {i+1}/{len(mids)} en {time.time()-t0:.1f}s", flush=True)
+    else:
+        from multiprocessing import Pool
+        print(f"  M11 raw paralelo: {n_workers} workers x {len(mids)} matches",
+              flush=True)
+        with Pool(processes=n_workers) as pool:
+            for i, res in enumerate(pool.imap_unordered(
+                    _phys_metrics_safe, mids, chunksize=1)):
+                if res is not None:
+                    dfs.append(res)
+                if (i+1) % 16 == 0:
+                    print(f"  {i+1}/{len(mids)} done en {time.time()-t0:.1f}s",
+                          flush=True)
+
+    dfs = [d for d in dfs if d is not None and d.height > 0]
     out = pl.concat(dfs) if dfs else pl.DataFrame(schema=_PHYS_SCHEMA)
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)

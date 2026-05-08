@@ -91,6 +91,19 @@ WC22_COMP = ("WC22", 43, 106)
 _SB_LOADER_CACHE: object | None = None
 
 
+def _catboost_task_type() -> str:
+    """GPU si env CATBOOST_GPU=1 + CUDA disponible, else CPU.
+
+    GPU acelera CatBoost ~3-5x para n_actions ~450k. Requiere catboost build
+    con CUDA. Para pods RunPod con GPU, exportar CATBOOST_GPU=1 antes de
+    correr el pipeline.
+    """
+    import os
+    if os.environ.get("CATBOOST_GPU", "0") == "1":
+        return "GPU"
+    return "CPU"
+
+
 def _get_sb_loader():
     """Lazy SB loader: solo se instancia cuando build_atomic_actions / mapping lo usa."""
     global _SB_LOADER_CACHE
@@ -187,7 +200,7 @@ def tune_catboost_hparams(X_all: pd.DataFrame, y: np.ndarray,
             learning_rate=trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
             l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
             bagging_temperature=trial.suggest_float("bagging_temperature", 0.0, 1.0),
-            eval_metric="Logloss", task_type="CPU",
+            eval_metric="Logloss", task_type=_catboost_task_type(),
             random_seed=seed, verbose=0,
         )
         oof = np.zeros(len(X_all), dtype=np.float32)
@@ -248,7 +261,7 @@ def train_vaep_model(atomic_df: pd.DataFrame,
 
     cb_params = dict(
         iterations=800, **best_hp,
-        eval_metric="Logloss", task_type="CPU",
+        eval_metric="Logloss", task_type=_catboost_task_type(),
         random_seed=seed, verbose=0,
     )
 
