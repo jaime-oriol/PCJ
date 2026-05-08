@@ -426,6 +426,21 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
     else:
         agg = agg.with_columns(pl.lit(0.0).alias("xpress_value_minute"))
 
+    # VDEP stricto (Toda 2022): cabeza dedicada P(recovery_in_3) - C*P(attacked_in_5)
+    vdep_path = _DERIVED / "vdep_strict" / "per_minute.parquet"
+    if vdep_path.exists():
+        vd = pl.read_parquet(vdep_path).select([
+            "pff_match_id", "pff_player_id", "period", "minute_in_period",
+            "vdep_strict_minute",
+        ])
+        agg = agg.join(
+            vd, on=["pff_match_id", "pff_player_id",
+                     "period", "minute_in_period"],
+            how="left",
+        ).with_columns(pl.col("vdep_strict_minute").fill_null(0.0))
+    else:
+        agg = agg.with_columns(pl.lit(0.0).alias("vdep_strict_minute"))
+
     def_ctx = build_def_third_all(cache=True)
     if def_ctx.height > 0:
         # def_ctx publica `minute` period-relative -> renombrar a minute_in_period
@@ -447,24 +462,28 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
             pl.lit(None, dtype=pl.Int64).alias("oppo_possession_frames"),
         ])
 
-    # Canal defensa SOTA v2: vdep_like (defensive_value sobre acciones defensivas
-    # SPADL — Toda 2022 -like) + xpress_value (Lee 2025 P(recovery<5s|press)
-    # calibrado). Captura tanto pressing alto como bloque bajo, alineado con
-    # la propuesta §Solidez Defensiva. score_def_minute (legacy: defensive_value
-    # sobre TODAS las acciones) preservado como sensitivity.
-    agg = agg.with_columns(
+    # Canal defensa SOTA v3 (TOP REAL): vdep_strict (Toda 2022 fiel, cabeza
+    # dedicada P(recovery)-C*P(attacked) AUC 0.80) + xpress_value (Lee 2025
+    # P(recovery<5s|press) tracking 25Hz AUC 0.62). Captura acciones
+    # defensivas valoradas + pressing calibrado.
+    # v2 legacy (vdep_like + xpress) y vdep_like_minute preservados sensitivity.
+    agg = agg.with_columns([
         (pl.col("vdep_like_minute") + pl.col("xpress_value_minute"))
-            .alias("score_def_v2_minute")
-    )
+            .alias("score_def_v2_minute"),
+        (pl.col("vdep_strict_minute") + pl.col("xpress_value_minute"))
+            .alias("score_def_v3_minute"),
+    ])
 
     # Schema canonico: ids -> tiempo -> metricas -> contexto off-ball
     agg = agg.select([
         "pff_match_id", "sb_match_id",
         "pff_player_id", "sb_player_id",
         "period", "minute_in_period", "sec_abs",
-        "score_def_v2_minute",                  # OUTCOME PRINCIPAL canal defensa
+        "score_def_v3_minute",                  # OUTCOME PRINCIPAL: vdep_strict + xpress
+        "score_def_v2_minute",                  # v2 legacy (vdep_like + xpress)
         "score_def_minute", "vdep_like_minute",  # legacy + componente
-        "press_value_minute", "xpress_value_minute",  # sensitivity
+        "vdep_strict_minute",                    # Toda 2022 cabeza dedicada
+        "press_value_minute", "xpress_value_minute",
         "n_def_actions", "n_actions_total",
         "def_third_pct", "press_intensity_frames", "oppo_possession_frames",
     ])
@@ -514,9 +533,11 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         (pl.col("sec_abs") < pl.col("window_pre_end")) &
         (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
+        pl.col("score_def_v3_minute").sum().alias("score_def_v3_pre"),
         pl.col("score_def_v2_minute").sum().alias("score_def_v2_pre"),
         pl.col("score_def_minute").sum().alias("score_def_pre"),
         pl.col("vdep_like_minute").sum().alias("vdep_like_pre"),
+        pl.col("vdep_strict_minute").sum().alias("vdep_strict_pre"),
         pl.col("n_def_actions").sum().cast(pl.Int64).alias("n_def_actions_pre"),
         pl.col("press_intensity_frames").sum().cast(pl.Int64)
             .alias("press_frames_pre"),
@@ -526,9 +547,11 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         (pl.col("sec_abs") <= pl.col("window_post_end")) &
         (pl.col("period") == pl.col("shock_period"))
     ).group_by(["match_id","shock_id","pff_player_id","shock_type"]).agg([
+        pl.col("score_def_v3_minute").sum().alias("score_def_v3_post"),
         pl.col("score_def_v2_minute").sum().alias("score_def_v2_post"),
         pl.col("score_def_minute").sum().alias("score_def_post"),
         pl.col("vdep_like_minute").sum().alias("vdep_like_post"),
+        pl.col("vdep_strict_minute").sum().alias("vdep_strict_post"),
         pl.col("n_def_actions").sum().cast(pl.Int64).alias("n_def_actions_post"),
         pl.col("press_intensity_frames").sum().cast(pl.Int64)
             .alias("press_frames_post"),
@@ -553,12 +576,16 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         .join(post, on=["match_id","shock_id","pff_player_id","shock_type"],
               how="left")
         .with_columns([
+            pl.col("score_def_v3_pre").fill_null(0.0),
+            pl.col("score_def_v3_post").fill_null(0.0),
             pl.col("score_def_v2_pre").fill_null(0.0),
             pl.col("score_def_v2_post").fill_null(0.0),
             pl.col("score_def_pre").fill_null(0.0),
             pl.col("score_def_post").fill_null(0.0),
             pl.col("vdep_like_pre").fill_null(0.0),
             pl.col("vdep_like_post").fill_null(0.0),
+            pl.col("vdep_strict_pre").fill_null(0.0),
+            pl.col("vdep_strict_post").fill_null(0.0),
             pl.col("n_def_actions_pre").fill_null(0),
             pl.col("n_def_actions_post").fill_null(0),
             pl.col("press_frames_pre").fill_null(0),
@@ -571,7 +598,26 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         & pl.col("pff_player_id").is_not_null()
     )
 
-    # LOO outcome principal (canal defensa v2 SOTA: vdep_like + xpress_value)
+    # LOO outcome principal v3 (vdep_strict + xpress)
+    loo_v3 = attach_team_loo(
+        pm_for_loo, value_col="score_def_v3_minute",
+    ).rename({
+        "score_def_v3_minute_team_loo_pre":  "score_def_v3_team_loo_pre",
+        "score_def_v3_minute_team_loo_post": "score_def_v3_team_loo_post",
+        "score_def_v3_minute_relative_pre":  "score_def_v3_relative_pre",
+        "score_def_v3_minute_relative_post": "score_def_v3_relative_post",
+        "score_def_v3_minute_delta_player":  "score_def_v3_delta_player",
+        "score_def_v3_minute_delta_team_loo":"score_def_v3_delta_team_loo",
+        "score_def_v3_minute_delta_relative":"score_def_v3_delta_relative",
+    }).select([
+        "match_id", "shock_id", "pff_player_id", "shock_type",
+        "score_def_v3_team_loo_pre", "score_def_v3_team_loo_post",
+        "score_def_v3_relative_pre", "score_def_v3_relative_post",
+        "score_def_v3_delta_player", "score_def_v3_delta_team_loo",
+        "score_def_v3_delta_relative", "n_block",
+    ])
+
+    # LOO v2 legacy (vdep_like + xpress) — sensitivity
     loo_v2 = attach_team_loo(
         pm_for_loo, value_col="score_def_v2_minute",
     ).rename({
@@ -587,7 +633,7 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
         "score_def_v2_team_loo_pre", "score_def_v2_team_loo_post",
         "score_def_v2_relative_pre", "score_def_v2_relative_post",
         "score_def_v2_delta_player", "score_def_v2_delta_team_loo",
-        "score_def_v2_delta_relative", "n_block",
+        "score_def_v2_delta_relative",
     ])
 
     # LOO legacy score_def_minute (sensitivity)
@@ -627,6 +673,8 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
 
     out = (
         out
+        .join(loo_v3, on=["match_id","shock_id","pff_player_id","shock_type"],
+              how="left")
         .join(loo_v2, on=["match_id","shock_id","pff_player_id","shock_type"],
               how="left")
         .join(loo, on=["match_id","shock_id","pff_player_id","shock_type"],
@@ -643,23 +691,28 @@ def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
             "pff_match_id", "sb_match_id",
             "shock_id", "shock_type",
             "pff_player_id", "sb_player_id",
-            # Outcome principal canal defensa SOTA v2 (vdep_like + xpress_value)
+            # Outcome principal v3 (vdep_strict Toda 2022 + xpress Lee 2025)
+            "score_def_v3_pre", "score_def_v3_post",
+            "score_def_v3_team_loo_pre", "score_def_v3_team_loo_post",
+            "score_def_v3_relative_pre", "score_def_v3_relative_post",
+            "score_def_v3_delta_player", "score_def_v3_delta_team_loo",
+            "score_def_v3_delta_relative",
+            # v2 legacy (vdep_like + xpress) — sensitivity
             "score_def_v2_pre", "score_def_v2_post",
             "score_def_v2_team_loo_pre", "score_def_v2_team_loo_post",
             "score_def_v2_relative_pre", "score_def_v2_relative_post",
             "score_def_v2_delta_player", "score_def_v2_delta_team_loo",
             "score_def_v2_delta_relative",
-            # Legacy score_def_minute (sensitivity)
             "score_def_pre", "score_def_post",
             "score_def_team_loo_pre", "score_def_team_loo_post",
             "score_def_relative_pre", "score_def_relative_post",
             "score_def_delta_player", "score_def_delta_team_loo",
             "score_def_delta_relative",
-            # Maejima light press_value (sensitivity)
             "press_value_team_loo_pre", "press_value_team_loo_post",
             "press_value_delta_player", "press_value_delta_team_loo",
             "press_value_delta_relative",
             "vdep_like_pre", "vdep_like_post",
+            "vdep_strict_pre", "vdep_strict_post",
             "n_def_actions_pre", "n_def_actions_post",
             "press_frames_pre", "press_frames_post",
             "n_block",

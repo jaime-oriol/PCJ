@@ -84,7 +84,9 @@ HONEST_M_VALUES     = (0.5, 1.0, 2.0) # Rambachan-Roth M restrictions
 CHANNELS: dict[str, tuple[str, str, float | None]] = {
     "ataque":  ("ataque/per_minute.parquet",  "score_atk_minute", 0.0),
     # Canal defensa v2 SOTA (vdep_like + xpress_value calibrado, Lee 2025 + Toda 2022)
-    "defensa": ("defensa/per_minute.parquet", "score_def_v2_minute", 0.0),
+    # Canal defensa v3 SOTA: vdep_strict (Toda 2022 cabeza dedicada AUC 0.80)
+    # + xpress_value (Lee 2025 tracking 25Hz AUC 0.62).
+    "defensa": ("defensa/per_minute.parquet", "score_def_v3_minute", 0.0),
     # c_obso_mean (counterfactual Teranishi 2022) — raw OBSO descartado tras
     # validacion T1.2: raw -0.21 vs c_obso +0.30 con PFF off grades.
     # null cuando atacking_frames=0 → fill 0 (jugador no atacaba ese minuto)

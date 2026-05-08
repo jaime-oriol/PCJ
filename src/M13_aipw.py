@@ -81,7 +81,8 @@ SHOCK_TYPES     = ("GOAL_FOR", "GOAL_AGAINST")
 CHANNELS: dict[str, tuple[str, str, float | None]] = {
     "ataque":  ("ataque/per_minute.parquet",  "score_atk_minute", 0.0),
     # Canal defensa v2 SOTA (vdep_like + xpress_value calibrado, Lee 2025 + Toda 2022)
-    "defensa": ("defensa/per_minute.parquet", "score_def_v2_minute", 0.0),
+    # Canal defensa v3 SOTA: vdep_strict (Toda 2022) + xpress (Lee 2025).
+    "defensa": ("defensa/per_minute.parquet", "score_def_v3_minute", 0.0),
     "offball": ("offball/per_minute.parquet", "obso_mean",        0.0),
     "fisico":  ("fisico/per_minute.parquet",  "score_phys",       None),
 }
