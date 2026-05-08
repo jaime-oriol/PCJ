@@ -4,41 +4,52 @@ M09_defensa - Canal Solidez Defensiva.
 Fase 2 PCJ, canal 2 de 4. Valora la contribucion defensiva individual por
 jugador-minuto combinando on-ball (VAEP) con off-ball (tracking PFF 25 Hz).
 
-Reutiliza el modelo atomic-VAEP entrenado en M08 (CatBoost 5-fold CV +
-Optuna + isotonic). defensive_value(action) mide cuanto REDUCE
-P(encajar_en_10_acciones) la accion del defensor (formula atomic-VAEP).
+Outcome principal SOTA v4 = vdep_strict + xpress + maejima_value (3 cabezas
+complementarias). Reutiliza el modelo atomic-VAEP entrenado en M08 (CatBoost
+5-fold CV + Optuna + isotonic) como base on-ball.
 
-Cuatro sub-canales agregados per (match, player, minute):
-  1. score_def_minute       : sum(defensive_value) sobre TODAS las acciones on-ball.
-  2. vdep_like_minute       : sum(defensive_value) FILTRADO a acciones defensivas
-                              (tackle, interception, clearance, foul, keeper_*).
-                              **VDEP-LIKE, no VDEP stricto.** Toda et al. 2022
-                              (PLOS ONE) entrena una cabeza dedicada
-                              P(recovery) − C·P(attacked) con XGBoost; aqui
-                              reusamos la cabeza P(concedes) de atomic-VAEP M08
-                              condicionada al subset de acciones defensivas.
-                              Equivalente bajo mismo horizonte (10 acciones) y
-                              corpus, pero NO es VDEP fiel a la spec original.
-                              Renombrado de `vdep_minute` -> `vdep_like_minute`
-                              para no afirmar el metodo Toda explicitamente.
-  3. def_third_pct          : fraccion de frames en el tercio defensivo propio
-                              durante posesion rival (bloque bajo).
-  4. press_intensity_frames : # frames-jugador a <= 3 m del balon durante posesion
-                              rival (aprox. Bekkers 2024 arXiv:2501.04712).
+Cabezas/sub-canales agregados per (match, player, minute):
+  - score_def_v4_minute      : OUTCOME PRINCIPAL = vdep_strict + xpress + maejima.
+  - vdep_strict_minute       : VDEP fiel a Toda et al. 2022 (PLOS ONE), cabeza
+                               dedicada P(recovery_in_3) − C·P(attacked_in_5)
+                               entrenada aparte (modulo vdep_strict cache).
+  - xpress_value_minute      : exPress de Lee et al. 2025 — P(recovery<5s | press
+                               event) calibrada via tracking PFF 25 Hz.
+  - maejima_value_minute     : Maejima 2024 nearest-defender — credito al defensor
+                               mas cercano por accion offensive del oponente
+                               (frame-level via tracking).
+  - press_value_minute       : Maejima light via PFF initialPressurePlayerId
+                               (peso fijo: A=0.5, L=1.0, P=2.0; +50% si
+                               initialTouchType ∈ {M,B} = press rompe touch).
+  - score_def_minute         : sum(defensive_value) on-ball legacy (sensitivity).
+  - vdep_like_minute         : defensive_value filtrado a acciones defensivas
+                               SPADL (tackle/interception/clearance/foul/keeper_*).
+                               NO es VDEP strict (reusa cabeza P(concedes) M08);
+                               sensitivity vs vdep_strict_minute.
+  - def_third_pct            : fraccion de frames en tercio defensivo propio
+                               durante posesion rival (bloque bajo).
+  - press_intensity_frames   : # frames-jugador a <= PRESS_RADIUS_M del balon
+                               durante posesion rival (aprox. Bekkers 2024
+                               arXiv:2501.04712).
 
 Output:
   data/parquet/derived/defensa/
     def_third_context.parquet    # (pff_match_id, player_id, minute,
                                  #  def_third_pct, press_intensity_frames,
                                  #  oppo_possession_frames)
-    per_minute.parquet           # sb_match_id + pff_match_id + sb/pff_player_id +
-                                 #  minute + score_def_minute + vdep_minute +
-                                 #  n_def_actions + n_actions_total +
+    press_value.parquet          # Maejima light per (match, player, minute)
+    per_minute.parquet           # ids + period + minute_in_period + sec_abs +
+                                 #  score_def_v{4,3,2}_minute + score_def_minute +
+                                 #  vdep_like + vdep_strict + maejima + xpress +
+                                 #  press_value + n_def_actions + n_actions_total +
                                  #  def_third_pct + press_intensity_frames +
                                  #  oppo_possession_frames
-    per_shock_window.parquet     # (match_id, shock_id, pff_player_id, shock_type,
-                                 #  score_def_{pre,post}, vdep_{pre,post},
-                                 #  n_def_actions_{pre,post}, press_frames_{pre,post})
+    per_shock_window.parquet     # (pff_match_id, sb_match_id, shock_id,
+                                 #  pff_player_id, sb_player_id, shock_type) +
+                                 #  v4/v3/v2/legacy pre/post + LOO +
+                                 #  delta_relative para cada nivel +
+                                 #  vdep_like/vdep_strict/maejima pre/post +
+                                 #  press_frames + n_def_actions
 
 Acceptance (ARCHITECTURE): distribucion score_def por rol coherente
 (CBs y DMs > CFs); GK score_def positivo por saves etc.
@@ -387,7 +398,7 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
         "period_id": "period",
     })
 
-    # Mapping ids via APIs publicas (X1+X2)
+    # Mapping ids: sb_match_id (M03) + sb_player_id (M08 cascada SB→PFF)
     sb2pff = sb_to_pff_match_id()
     player_map = atk.build_sb_to_pff_player_map(cache=True).select([
         pl.col("sb_player_id").cast(pl.Int64),
@@ -460,7 +471,7 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
     def_ctx = build_def_third_all(cache=True)
     if def_ctx.height > 0:
         # def_ctx publica `minute` period-relative -> renombrar a minute_in_period
-        # para alinear con el schema X3 estandarizado.
+        # para alinear con el resto del schema canonico de M09.
         def_ctx_cast = def_ctx.with_columns([
             pl.col("pff_match_id").cast(pl.Int64),
             pl.col("player_id").cast(pl.Int64).alias("pff_player_id"),
@@ -525,7 +536,7 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
 def aggregate_per_shock_window(cache: bool = True) -> pl.DataFrame:
     """Por cada (shock, player), suma score_def y n_def_actions en pre/post.
 
-    Schema (X3): pff_match_id + sb_match_id + pff_player_id + sb_player_id.
+    Schema: pff_match_id + sb_match_id + pff_player_id + sb_player_id.
     Filtra por sec_abs real (no minute*60 sintetico). vdep_like_minute en
     lugar de vdep_minute para honestidad semantica (no es VDEP de Toda 2022
     stricto, ver docstring de modulo).
@@ -806,7 +817,7 @@ if __name__ == "__main__":
                   f"{ctx_valid['def_third_pct'].max():.3f}]")
 
     # Acceptance: distribucion por rol (CBs + DMs > CFs).
-    # per_min ya trae pff_player_id (schema X3 estandarizado).
+    # per_min ya trae pff_player_id desde aggregate_per_player_minute.
     print("\n[2] Acceptance — score_def por rol (CBs/DMs > CFs):")
     ro = load_rosters().select(["player_id","position_group"]) \
                        .unique(subset=["player_id"]) \
