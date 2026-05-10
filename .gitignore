@@ -1,9 +1,13 @@
 # Datos RAW (NO versionar): originales + extraidos parquet
 data_mundial/
 data/public/
-data/parquet/pff/
 data/parquet/wyscout/
 data/parquet/statsbomb/
+# data/parquet/pff/: subimos events + metadata + rosters (~69 MB, M15 los
+# necesita para player_minutes + nearmiss_exposure). NO subimos tracking
+# (5 GB, solo M10/M11 lo necesitan y ya estan cacheados en derived/offball
+# y derived/fisico).
+data/parquet/pff/tracking/
 # Caches derivadas SI se versionan (output regenerable del pipeline,
 # pero util tenerlas trackeadas para reproducir resultados sin recomputar):
 #   data/parquet/derived/    -> SI versionar
@@ -82,12 +86,6 @@ logs/
 
 # Cache socceraction StatsBombLoader (raw API cache, no necesario)
 catboost_info/
-
-# Scripts operativos (monitor con IP/puerto del pod, no metodologia)
-scripts/
-
-# Claude Code session metadata
-.claude/
 
 # cate_nuts.pkl es 409 MB (samples NUTS 4 chains x 1000 samples), supera
 # limite GitHub 100MB. Regenerable corriendo M14 con panel_delta cacheado.
