@@ -90,3 +90,9 @@ catboost_info/
 # cate_nuts.pkl es 409 MB (samples NUTS 4 chains x 1000 samples), supera
 # limite GitHub 100MB. Regenerable corriendo M14 con panel_delta cacheado.
 data/parquet/derived/cate/model/cate_nuts.pkl
+
+# Caches intermedios per-match de M10/M11 (resume-after-crash). Los agregados
+# finales (per_minute, raw_per_minute, per_shock_window) si se versionan;
+# estos per-match son redundantes y se regeneran solos al re-correr M10/M11.
+data/parquet/derived/offball/per_match/
+data/parquet/derived/fisico/raw_per_match/
