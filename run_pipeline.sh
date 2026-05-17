@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
-# run_pipeline.sh - Pipeline E2E COMPLETO al maximo (todos Optuna trials,
-# SVI steps, NUTS samples) con paralelizacion agresiva CPU + GPU opcional.
+# run_pipeline.sh - Pipeline E2E del PCJ (M01-M15 + Z01-Z06).
 #
-# Tiempo objetivo en RunPod RTX 4090 (16 cores + 24GB GPU): ~90-120 min.
-# Tiempo en CPU 16 cores sin GPU: ~3-4h.
-# Tiempo CPU serial (sin paralelizar): ~5-7h.
+# Reproduce el pipeline completo extremo a extremo. Idempotente: cada modulo
+# cachea su salida en data/parquet/derived/; si la cache existe, la etapa la
+# reusa y pasa al instante. Auto-detecta nucleos (nproc) y GPU (nvidia-smi)
+# y se adapta a CPU o GPU sin tocar nada.
 #
-# Variables de entorno relevantes:
-#   PYTHON           : binario python (default: python)
-#   N_WORKERS_M10    : workers paralelos M10 OBSO (recomendado: nproc, default 1)
-#   N_WORKERS_M11    : workers paralelos M11 raw  (recomendado: nproc, default 1)
-#   CATBOOST_GPU     : =1 → CatBoost en GPU (requiere catboost+CUDA build)
-#   N_TRIALS_OPTUNA  : trials Optuna (default 15; M05 usa su propio default 60)
-#   FORCE_CLEAN      : =1 borra derived/* antes
-#   SKIP_M10         : =1 salta M10 (debug rapido)
-#   SKIP_M14         : =1 salta M14 NUTS
+# USO
+#   ./run_pipeline.sh                  # run normal (cache-hit en lo ya generado)
+#   FORCE_CLEAN=1 ./run_pipeline.sh    # regen total desde cero
 #
-# RECOMENDACION RUNPOD para 2h flujo TOP:
-#   Pod: RTX 4090 (24GB) + 16 cores + 64GB RAM (~$0.34-0.50/h)
-#   Lanzar:
-#     export N_WORKERS_M10=16 N_WORKERS_M11=16 CATBOOST_GPU=1
-#     export JAX_PLATFORMS=gpu     # para M14 NUTS GPU
-#     ./run_pipeline.sh
-#   Coste estimado: 2h × $0.50 = $1.00.
+# REQUISITOS
+#   - Python con las dependencias del proyecto (ver README). Si el binario no
+#     es `python`, indicalo con: PYTHON=/ruta/al/python ./run_pipeline.sh
+#   - Run normal: basta el repo clonado — las caches derived/ van versionadas.
+#   - FORCE_CLEAN: ademas necesita los datos raw (PFF tracking, StatsBomb,
+#     Wyscout) que NO van en el repo (ver README, seccion Datos).
+#
+# TIEMPOS ORIENTATIVOS (regen total FORCE_CLEAN; run normal = segundos)
+#   GPU + 16 nucleos ~1.5-2 h  |  CPU 16 nucleos ~3-4 h  |  CPU serial ~5-7 h
+#
+# VARIABLES DE ENTORNO (todas opcionales)
+#   PYTHON          : binario python (default: python)
+#   N_WORKERS_M10   : workers paralelos M10 OBSO    (default: nproc)
+#   N_WORKERS_M11   : workers paralelos M11 fisico  (default: nproc)
+#   CATBOOST_GPU    : =1 CatBoost en GPU            (default: auto segun GPU)
+#   JAX_PLATFORMS   : cpu|gpu para M14 NUTS         (default: auto segun GPU)
+#   N_TRIALS_OPTUNA : trials Optuna                 (default 15; M05 usa 60)
+#   FORCE_CLEAN     : =1 borra derived/* + cache/vaep antes de empezar
+#   SKIP_M10        : =1 salta M10 OBSO (debug rapido)
+#   SKIP_M14        : =1 salta M14 NUTS
 
 set -euo pipefail
 cd "$(dirname "$0")"
