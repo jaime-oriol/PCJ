@@ -864,11 +864,13 @@ def mean_brier(X: pl.DataFrame, fit_result: dict) -> float:
 # ===========================================================================
 
 def et_goal_rate_empirical() -> tuple[float, float]:
-    """Tasa empirica goals/min en ET desde partidos con duration ExtraTime.
+    """Tasa empirica goals/min en tiempo extra (ET).
 
-    Usa Wyscout duration=ExtraTime (3) + StatsBomb Euro20/Euro24 con ET (~15).
-    Devuelve (lambda_home_per_min, lambda_away_per_min). Si el corpus es
-    pequeno, devuelve tasas empiricas WC22-compatibles (0.025/0.020).
+    Intenta estimarla de Wyscout duration=ExtraTime, pero el open dataset
+    solo trae ~3 partidos con ET — por debajo del minimo (5) para una tasa
+    estable —, asi que en la practica SIEMPRE devuelve la tasa fallback
+    empirica WC22-compatible (0.025 home / 0.020 away). Devuelve
+    (lambda_home_per_min, lambda_away_per_min).
     """
     # Wyscout: duration ExtraTime (3 partidos). Contar scoreET per team.
     wm = load_wyscout_matches().filter(pl.col("duration") == "ExtraTime")

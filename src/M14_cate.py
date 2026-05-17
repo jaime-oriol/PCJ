@@ -22,8 +22,8 @@ SOTA implementado:
   Priors PFF grades informativos      Gomes-Mendes-Neves 2025       gamma coef
   3-level hierarchy (player⊂team⊂pos) Yurko 2019, Maas-Hox 2005     hierarchy
   HMC/NUTS exact MCMC                 Hoffman-Gelman 2014           NUTS 4 chains
-  R-hat + ESS convergence             Gelman-Rubin 1992 /           R-hat manual
-                                      Vehtari 2021
+  split-R-hat + ESS convergence       Gelman et al. 2013 /          numpyro.
+                                      Vehtari et al. 2021           diagnostics
   Posterior predictive checks         Gelman et al. 2013            simulate +
                                                                     KS + mean/sd
 
@@ -35,22 +35,33 @@ Implementacion numpyro multivariate COMPLETA:
   - Priors informativos PFF_grade · gamma_k (Gomes-Mendes-Neves)
   - target_accept_prob=0.95 para topologia LKJ + jerarquia 3 niveles
   - R-hat < 1.05 + ESS_bulk > 400 verificado
-  - Smoke test 2-chain × 100 iter antes del run completo
+  - Smoke test 2-chain × (200 warmup + 200 samples) antes del run completo
 
 Modelo (NCP completo — Betancourt-Girolami 2015):
-    delta_iks ~ Normal(mu_shock[s,k] + b_context[i,k] + eta[i,s,k], sigma_eps[k])
+    delta_iks ~ Normal(
+        mu_shock[s,k] + b_context[i,k]
+        + eta[i,s,k] + eta_x_td[i,s,k] * team_direction_z
+        + b_min[k]*minute_norm + b_score[k]*score_diff_post_z
+        + b_phase[k]*week_idx_norm + b_lev[k]*leverage_z
+        + b_elim[k]*elim_prox_z + eta_pressure[i,k] * elim_prox_z,
+        sigma_eps[k])
     b_context[i,k] = gamma[k]*pff_grade[i] + b_team[t(i),k] + b_position[p(i),k]
-    b_team[t,k]    = sigma_team[k]     * b_team_raw[t,k]     (NCP)
-    b_position[p,k] = sigma_pos[k]     * b_pos_raw[p,k]      (NCP)
-    eta[i,GA,:] = (sigma_ga * L_ga_corr) @ eta_raw_ga[i,:]   (NCP chasing)
-    eta[i,GF,:] = (sigma_gf * L_gf_corr) @ eta_raw_gf[i,:]   (NCP protecting)
-    L_ga_corr, L_gf_corr ~ LKJCholesky(K=4, concentration=2.0)
-    eta_raw_ga[i,:], eta_raw_gf[i,:] ~ Normal(0,1)
-    b_team_raw[t,:], b_pos_raw[p,:] ~ Normal(0,1)
-    mu_shock[s,k] ~ Normal(0, 0.5)  — shock-type population mean
-    sigma_ga, sigma_gf, sigma_team, sigma_pos ~ HalfNormal(0.5)
-    sigma_eps ~ HalfNormal(1.0)
-    gamma[k] ~ Normal(0, 1)
+    b_team, b_position : NCP (sigma_* * raw, raw ~ Normal(0,1))
+    5 etas individuales, cada una NCP + LKJ cross-canal propia:
+      eta_ga, eta_gf            respuesta base por shock_type
+      eta_ga_x_td, eta_gf_x_td  pendiente individual x direccion del bloque
+      eta_pressure              pendiente individual x elim_prox_z
+    eta_s[i,:] = (sigma_s * L_s_corr) @ eta_raw_s[i,:]  (NCP, eta_raw ~ N(0,1))
+    L_*_corr ~ LKJCholesky(K=4, concentration=2.0)  (5 matrices)
+    mu_shock[s,k] ~ Normal(0, 0.5)
+    b_min/b_score/b_phase/b_lev/b_elim[k] ~ Normal(0, 0.5)
+    sigma_ga/gf/team/position/pressure ~ HalfNormal(0.5)
+    sigma_ga_x_td, sigma_gf_x_td ~ HalfNormal(0.3)  (regularizacion fuerte)
+    sigma_eps ~ HalfNormal(1.0);  gamma[k] ~ Normal(0, 1)
+
+Convergencia: los 2 bloques eta_x_td (interaccion team-direction) estan
+infra-identificados con N=172 shocks (sus LKJ no convergen, R-hat ~1.07).
+La capa fiable es eta_ga / eta_gf / eta_pressure. Detalle en docs/TFM.md.
 
 donde:
     delta_iks = (post - pre) z-score within (channel, shock_type)
@@ -532,12 +543,21 @@ def fit_cate_nuts(panel: pl.DataFrame,
 # ===========================================================================
 
 def compute_diagnostics(fit: dict) -> pl.DataFrame:
-    """R-hat (Gelman-Rubin 1992) + ESS bulk (Vehtari 2021) por param escala.
+    """split-R-hat + ESS por componente escalar de cada parametro de escala.
 
+    Usa los estimadores SOTA de numpyro.diagnostics:
+      - split_gelman_rubin   : R-hat con split-chains (Gelman et al. 2013).
+      - effective_sample_size: ESS rank-normalizada (Vehtari et al. 2021).
     Acceptance: R-hat < 1.05 + ESS_bulk > 400 = convergencia OK.
-    Solo diagnostica params de escala + correlacion. Los raw NCP (P x K)
-    y los deterministic (eta_ga, eta_gf) se omiten por volume.
+
+    Diagnostica params de escala/correlacion/efectos globales; omite los raw
+    NCP (N(0,1) by design) y los deterministic (derivados). Acepta tanto
+    `samples_per_chain` (in-memory tras fit) como `samples` plano — NUTS
+    concatena las chains en orden por axis 0, asi que se reconstruyen
+    reshapeando a (n_chains, n_samples, ...).
     """
+    from numpyro.diagnostics import effective_sample_size, split_gelman_rubin
+
     # Solo params diagnosticables (escalas, correlaciones, efectos globales)
     _SKIP = frozenset({
         "eta_raw_ga", "eta_raw_gf", "eta_raw_pres",   # NCP raw — N(0,1) by design
@@ -548,48 +568,28 @@ def compute_diagnostics(fit: dict) -> pl.DataFrame:
         "b_team", "b_position",                        # deterministic — derived
         "b_context",                                   # deterministic
     })
-    samples = fit["samples_per_chain"]   # {param: (n_chains, n_samples, ...)}
+    if "samples_per_chain" in fit:
+        samples = fit["samples_per_chain"]
+    else:
+        nc = NUTS_NUM_CHAINS
+        samples = {k: v.reshape(nc, v.shape[0] // nc, *v.shape[1:])
+                   for k, v in fit["samples"].items()}
     rows = []
     for name, arr in samples.items():
         if name in _SKIP:
             continue
-        flat_arr = arr.reshape(arr.shape[0], arr.shape[1], -1)
-        for i in range(flat_arr.shape[2]):
-            x = flat_arr[:, :, i]   # (n_chains, n_samples)
-            rh = _r_hat(x)
-            ess_b = _ess_bulk(x)
+        # arr: (n_chains, n_samples, *event) -> R-hat/ESS por componente event
+        rh  = np.asarray(split_gelman_rubin(arr)).reshape(-1)
+        ess = np.asarray(effective_sample_size(arr)).reshape(-1)
+        for i in range(rh.size):
             rows.append({
                 "param":     name,
                 "idx":       i,
-                "r_hat":     float(rh),
-                "ess_bulk":  float(ess_b),
-                "converged": bool(rh < 1.05 and ess_b > 400),
+                "r_hat":     float(rh[i]),
+                "ess_bulk":  float(ess[i]),
+                "converged": bool(rh[i] < 1.05 and ess[i] > 400),
             })
     return pl.DataFrame(rows)
-
-
-def _r_hat(x: np.ndarray) -> float:
-    """Gelman-Rubin R-hat. x shape (n_chains, n_samples)."""
-    n, m = x.shape[1], x.shape[0]
-    chain_means = x.mean(axis=1)
-    chain_vars = x.var(axis=1, ddof=1)
-    W = chain_vars.mean()
-    B = n * chain_means.var(ddof=1)
-    var_hat = (n - 1) / n * W + B / n
-    return float(np.sqrt(var_hat / W)) if W > 0 else 1.0
-
-
-def _ess_bulk(x: np.ndarray) -> float:
-    """ESS bulk simplificado (autocorrelacion lag-1). x shape (chains, samples)."""
-    flat = x.flatten()
-    n = len(flat)
-    if n < 4:
-        return float(n)
-    rho = np.corrcoef(flat[:-1], flat[1:])[0, 1]
-    if np.isnan(rho) or rho >= 1:
-        return float(n)
-    ess = n * (1 - rho) / (1 + rho)
-    return max(float(ess), 1.0)
 
 
 # ===========================================================================

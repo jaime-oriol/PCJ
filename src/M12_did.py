@@ -35,6 +35,7 @@ jugador, y el N de matches (64) es bajo para clustering bidimensional.
 Outputs (data/parquet/derived/did/):
   panel_event_study.parquet     (player, shock, relative_min, channel, outcome)
   ate_population.parquet        (channel x shock_type -> ATE + IC + N)
+  ate_with_controls.parquet     (channel x shock_type -> ATE base + KO + leverage)
   event_study.parquet           (channel x shock_type x relative_min -> beta)
   honest_did.parquet            (channel x shock_type x M -> ATE robusto)
   diagnostics.parquet           (channel x shock_type -> pretrend_F, N flags)
@@ -666,6 +667,7 @@ def compute_all(cache: bool = True, overwrite: bool = False) -> dict[str, Path]:
     out_paths = {
         "panel":     _DERIVED / "panel_event_study.parquet",
         "ate":       _DERIVED / "ate_population.parquet",
+        "ate_ctrl":  _DERIVED / "ate_with_controls.parquet",
         "es":        _DERIVED / "event_study.parquet",
         "honest":    _DERIVED / "honest_did.parquet",
         "diag":      _DERIVED / "diagnostics.parquet",
@@ -718,8 +720,7 @@ def compute_all(cache: bool = True, overwrite: bool = False) -> dict[str, Path]:
 
     if cache:
         ate_df.write_parquet(out_paths["ate"], compression="snappy")
-        ate_ctrl_df.write_parquet(_DERIVED / "ate_with_controls.parquet",
-                                    compression="snappy")
+        ate_ctrl_df.write_parquet(out_paths["ate_ctrl"], compression="snappy")
         es_df_all.write_parquet(out_paths["es"], compression="snappy")
         honest_df.write_parquet(out_paths["honest"], compression="snappy")
         diag_df.write_parquet(out_paths["diag"], compression="snappy")

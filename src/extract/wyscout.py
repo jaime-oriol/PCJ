@@ -1,7 +1,7 @@
 """
 extract.wyscout - Extrae el open dataset Wyscout 2017/18 a parquet.
 
-5 ligas + WC 2018 + Euro 2016 (~1.825 partidos, ~3M eventos).
+5 ligas + WC 2018 + Euro 2016 (~1.941 partidos, ~3.25M eventos).
 
 Salida:
   data/parquet/wyscout/

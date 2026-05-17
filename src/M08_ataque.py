@@ -95,8 +95,8 @@ def _catboost_task_type() -> str:
     """GPU si env CATBOOST_GPU=1 + CUDA disponible, else CPU.
 
     GPU acelera CatBoost ~3-5x para n_actions ~450k. Requiere catboost build
-    con CUDA. Para pods RunPod con GPU, exportar CATBOOST_GPU=1 antes de
-    correr el pipeline.
+    con CUDA. En maquinas con GPU, exportar CATBOOST_GPU=1 antes de correr
+    el pipeline.
     """
     import os
     if os.environ.get("CATBOOST_GPU", "0") == "1":

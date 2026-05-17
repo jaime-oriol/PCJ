@@ -23,7 +23,7 @@ _OUT_DIR = _PSXG_DIR / "calibration"
 _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_model() -> tuple:
+def _load_model() -> dict:
     with open(_PSXG_DIR / "model" / "psxg_lgb.pkl", "rb") as f:
         fit = pickle.load(f)
     return fit

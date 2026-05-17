@@ -111,7 +111,8 @@ _POSS_HYSTERESIS_F = 2
 # ===========================================================================
 
 _DEF_CTX_SCHEMA = {
-    "pff_match_id": pl.Int64, "player_id": pl.Int64, "minute": pl.Int64,
+    "pff_match_id": pl.Int64, "player_id": pl.Int64,
+    "period": pl.Int64, "minute": pl.Int64,
     "def_third_pct": pl.Float64, "press_intensity_frames": pl.Int64,
     "oppo_possession_frames": pl.Int64,
 }
@@ -221,13 +222,21 @@ def _def_third_pct_match(match_id: int) -> pl.DataFrame:
         on=["team_id", "jersey_int"], how="inner",
     ).join(dir_df, on=["team_id", "period"], how="left")
 
+    # frameNum es video-time acumulado del partido (no resetea por period).
+    # Se convierte a minuto period-relativo restando el primer frame de cada
+    # period — igual que M10/M11 — para que el join con per_minute (que usa
+    # minute_in_period de SPADL, period-relativo) alinee bien la 2a parte.
+    period_start = frames.group_by("period").agg(
+        pl.col("frameNum").min().alias("p_start_frame"))
+
     # Metricas por frame-jugador
-    agg = all_def.with_columns([
-        (pl.col("frameNum") / frames_per_min).cast(pl.Int64).alias("minute"),
+    agg = all_def.join(period_start, on="period", how="left").with_columns([
+        (((pl.col("frameNum") - pl.col("p_start_frame")) / frames_per_min)
+         .cast(pl.Int64).alias("minute")),
         ((pl.col("def_sign") * pl.col("x")) < def_third_thr).alias("in_def_third"),
         (((pl.col("x") - pl.col("bx")) ** 2
           + (pl.col("y") - pl.col("by")) ** 2) <= press_r2).alias("pressing"),
-    ]).group_by(["player_id", "minute"]).agg([
+    ]).group_by(["player_id", "period", "minute"]).agg([
         pl.col("in_def_third").sum().cast(pl.Int64).alias("def_third_frames"),
         pl.col("pressing").sum().cast(pl.Int64).alias("press_intensity_frames"),
         pl.len().cast(pl.Int64).alias("oppo_possession_frames"),
@@ -470,17 +479,20 @@ def aggregate_per_player_minute(cache: bool = True) -> pl.DataFrame:
 
     def_ctx = build_def_third_all(cache=True)
     if def_ctx.height > 0:
-        # def_ctx publica `minute` period-relative -> renombrar a minute_in_period
-        # para alinear con el resto del schema canonico de M09.
+        # def_ctx publica `minute` ya period-relative -> renombrar a
+        # minute_in_period y joinear incluyendo `period` para no cruzar la
+        # 2a parte con el minuto homonimo de la 1a.
         def_ctx_cast = def_ctx.with_columns([
             pl.col("pff_match_id").cast(pl.Int64),
             pl.col("player_id").cast(pl.Int64).alias("pff_player_id"),
+            pl.col("period").cast(pl.Int64),
             pl.col("minute").cast(pl.Int64).alias("minute_in_period"),
-        ]).select(["pff_match_id", "pff_player_id", "minute_in_period",
+        ]).select(["pff_match_id", "pff_player_id", "period", "minute_in_period",
                    "def_third_pct", "press_intensity_frames",
                    "oppo_possession_frames"])
         agg = agg.join(def_ctx_cast,
-                        on=["pff_match_id", "pff_player_id", "minute_in_period"],
+                        on=["pff_match_id", "pff_player_id", "period",
+                            "minute_in_period"],
                         how="left")
     else:
         agg = agg.with_columns([

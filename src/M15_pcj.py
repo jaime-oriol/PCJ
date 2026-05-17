@@ -26,9 +26,9 @@ Decisiones de diseno:
   - Tier_certain = Elite/Top SOLO si IC80 excluye 0 (robust al ruido)
 
 Outputs:
-  outputs/pcj_table.parquet         (1 fila por jugador, ~120 cols)
-  outputs/pcj_aux/top10_chasing_per_position.parquet
-  outputs/pcj_aux/top10_protecting_per_position.parquet
+  outputs/pcj_table.parquet         (1 fila por jugador, ~277 cols)
+  outputs/pcj_aux/top10_{chasing,protecting,pressure}_per_position.parquet
+  outputs/pcj_aux/top10_{chasing,protecting,pressure}_per_bucket.parquet
   outputs/pcj_aux/dual_clutch_top.parquet
   outputs/pcj_aux/by_team.parquet
 
