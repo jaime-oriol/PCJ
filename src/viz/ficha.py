@@ -1,10 +1,12 @@
 """ficha - Ficha PCJ completa: radar + tabla de percentiles lado a lado.
 
-Tabla portada de jaime-oriol/footballdecoded (viz/stats_radar.py,
-`create_stats_table`): valores + percentil coloreado por canal, leyenda
-LOW->HIGH. Combinacion radar|tabla portada de `combine_radar_and_table`
-(PIL, dimensiones alineadas). Adaptado a outputs/pcj_table.parquet +
-identidad Diagonality.
+Tabla = port 1:1 de jaime-oriol/footballdecoded (viz/stats_radar.py,
+`create_stats_table`): cabecera + Minutos/Partidos, filas metrica con valor
++ percentil coloreado (node_cmap), sombreado alterno, leyenda 5 tramos +
+flecha BAJO->ALTO. Combinacion radar|tabla = `combine_radar_and_table`.
+
+Adaptaciones minimas vs el original: datos pcj_table, percentil vs POSICION,
+logo Diagonality (sin "Created by"), formato de valor para CATEs con signo.
 
 Uso:
     python -m src.viz.ficha "Messi"
@@ -13,6 +15,7 @@ Uso:
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +34,7 @@ from viz.radar import PCJ_METRICS, PCJ_TITLES, _find, player_radar
 
 _TABLE = _SRC.parent / "outputs" / "pcj_table.parquet"
 
-# Tabla en orden de bloque: 4 canales post-GA, luego 4 post-GF.
+# 8 dimensiones del radar, en orden de bloque post-GA / post-GF.
 TABLE_METRICS = [
     "cate_ataque_GOAL_AGAINST_mean",  "cate_defensa_GOAL_AGAINST_mean",
     "cate_offball_GOAL_AGAINST_mean", "cate_fisico_GOAL_AGAINST_mean",
@@ -44,94 +47,132 @@ TABLE_TITLES = [
     "Off-ball · post-GF", "Fisico · post-GF",
 ]
 
+_NAME_COLOR = "#FF6B6B"   # team_colors[0] del original footballdecoded
 
-def _fmt(v: float) -> str:
-    """Valor de celda: CATEs son pequenos con signo."""
+
+def _short(name: str, max_len: int = 16) -> str:
+    """'Lionel Messi' -> 'L. Messi' si es largo (idem _shorten_long_name)."""
+    if len(name) <= max_len:
+        return name
+    parts = name.split()
+    return f"{parts[0][0]}. {parts[-1]}" if len(parts) >= 2 else name
+
+
+def _fmt(v) -> str:
+    """Formato de celda. Mantiene la logica del original + rama para los
+    CATE (valores pequenos con signo, que el formato original aplastaria)."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return "0.000"
-    return f"{v:+.3f}" if abs(v) < 1 else f"{v:.1f}"
+    if abs(v) < 1:
+        return f"{v:+.3f}"
+    if abs(v) < 10:
+        return f"{v:.1f}"
+    return f"{int(v)}"
 
 
 def create_stats_table(df: pl.DataFrame, player_id: int,
                        metrics: list[str] = TABLE_METRICS,
                        metric_titles: list[str] = TABLE_TITLES,
-                       save_path=None, logo: bool = True):
-    """Tabla de stats con percentil coloreado (portado de create_stats_table).
+                       footer_text: str = "percentil vs los jugadores de su posicion",
+                       save_path=None):
+    """Tabla de stats con percentil coloreado. Port 1:1 de create_stats_table.
 
-    Modo single-player. Percentiles `{metric}_pct` calculados al vuelo
-    (rank vs dataset) si no estan en df.
+    Percentil `{metric}_pct` calculado vs el mismo position_group.
     """
     pdf = df.to_pandas()
-    for m in metrics:
-        if f"{m}_pct" not in pdf.columns:
-            pdf[f"{m}_pct"] = pdf[m].rank(pct=True) * 100.0
-    p = pdf[pdf["pff_player_id"] == player_id].iloc[0]
+    for m in metrics:                                    # percentil POR POSICION
+        pdf[f"{m}_pct"] = pdf.groupby("position_group")[m].rank(pct=True) * 100.0
+    p1 = pdf[pdf["pff_player_id"] == player_id].iloc[0]
 
-    norm = Normalize(vmin=0, vmax=100)
+    node_cmap = PCT_CMAP
+    percentile_norm = Normalize(vmin=0, vmax=100)
 
-    fig = plt.figure(figsize=(7.0, 9.0), facecolor=BG)
+    fig = plt.figure(figsize=(7.5, 8.5), facecolor=BG)
     ax = fig.add_subplot(111)
     ax.set_facecolor(BG)
     ax.set_xlim(0, 8.5)
     ax.set_ylim(0, 15)
     ax.axis("off")
 
-    # Cabecera: jugador + contexto
-    y = 14.4
-    ax.text(0.7, y, p.get("player_name", str(player_id)), fontweight="bold",
-            fontsize=15, color=WHITE, ha="left", va="center", family="DejaVu Sans")
-    ax.text(0.7, y - 0.5, f"{p.get('team_name','')}  ·  {p.get('position_group','')}"
-            f"  ·  Mundial Qatar 2022", fontsize=10, color="#c8c8c8", ha="left")
-    ax.plot([0.5, 8.0], [y - 0.95, y - 0.95], color="grey", lw=0.5, alpha=0.6)
+    y_start = 14.5
+    text1_x, p1_value_x, p1_pct_x = 3.4, 4.1, 4.5
 
-    # Bloque de exposicion
-    y = y - 1.45
-    for lbl, val in (("Minutos jugados", int(p.get("minutes_played", 0))),
-                     ("Partidos", int(p.get("n_matches_played", 0))),
-                     ("Shocks vividos (GF / GA)",
-                      f"{int(p.get('n_shocks_for',0))} / {int(p.get('n_shocks_against',0))}")):
-        ax.text(0.7, y, lbl, fontsize=10, color=WHITE, fontweight="bold", va="center")
-        ax.text(7.8, y, str(val), fontsize=10.5, color=WHITE, ha="right", va="center")
-        y -= 0.42
-    ax.plot([0.5, 8.0], [y + 0.07, y + 0.07], color="grey", lw=0.5, alpha=0.6)
+    # Cabecera: nombre + contexto
+    name1 = _short(p1.get("player_name", str(player_id)))
+    ax.text(text1_x, y_start, name1, fontweight="bold", fontsize=14,
+            color=_NAME_COLOR, ha="left", va="center", family="DejaVu Sans")
+    ax.text(text1_x, y_start - 0.425,
+            f"{p1.get('team_name', '')}  ·  {p1.get('position_group', '')}"
+            f"  ·  Mundial Qatar 2022",
+            fontsize=10, color=WHITE, alpha=0.9, ha="left", family="DejaVu Sans")
 
-    # Filas de metricas: valor + percentil coloreado
-    y -= 0.55
-    row_h = 0.92
-    for idx, (m, t) in enumerate(zip(metrics, metric_titles)):
-        yr = y - idx * row_h
+    y_line = y_start - 0.7
+    ax.plot([0.5, 8.5], [y_line, y_line], color="grey", linewidth=0.5, alpha=0.6)
+
+    # Minutos / Partidos
+    y_context = y_start - 1.2
+    ax.text(0.7, y_context, "Minutos jugados", fontsize=10, color=WHITE,
+            fontweight="bold", family="DejaVu Sans")
+    ax.text(p1_value_x, y_context, f"{int(p1.get('minutes_played', 0))}",
+            fontsize=11, color=WHITE, ha="right", family="DejaVu Sans")
+    y_context -= 0.4
+    ax.text(0.7, y_context, "Partidos jugados", fontsize=10, color=WHITE,
+            fontweight="bold", family="DejaVu Sans")
+    ax.text(p1_value_x, y_context, f"{int(p1.get('n_matches_played', 0))}",
+            fontsize=11, color=WHITE, ha="right", family="DejaVu Sans")
+
+    y_line = y_context - 0.3
+    ax.plot([0.5, 8.5], [y_line, y_line], color="grey", linewidth=0.5, alpha=0.6)
+
+    # Filas de metricas
+    y_metrics = y_context - 0.7
+    row_height = 1.0
+    for idx, (metric, title) in enumerate(zip(metrics, metric_titles)):
+        y_pos = y_metrics - idx * row_height
         if idx % 2 == 0:
-            ax.add_patch(Rectangle((0.5, yr - 0.38), 7.5, 0.76,
+            ax.add_patch(Rectangle((0.5, y_pos - 0.4), 8.0, 0.8,
                                    facecolor="white", alpha=0.05))
-        pct = p.get(f"{m}_pct", 0.0)
-        pct = 0.0 if pct is None or np.isnan(pct) else float(pct)
-        ax.text(0.7, yr, t, fontsize=10.5, color=WHITE, fontweight="bold", va="center")
-        ax.text(6.7, yr, _fmt(p.get(m)), fontsize=10.5, color=WHITE,
-                ha="right", va="center")
-        ax.text(7.85, yr, f"{int(pct)}", fontsize=11, fontweight="bold",
-                color=PCT_CMAP(norm(pct)), ha="right", va="center")
+        ax.text(0.7, y_pos, title, fontsize=10, color=WHITE, fontweight="bold",
+                va="center", family="DejaVu Sans")
+        pct = p1.get(f"{metric}_pct", 0)
+        pct = 0 if pct is None or np.isnan(pct) else float(pct)
+        ax.text(p1_value_x, y_pos, _fmt(p1.get(metric)), fontsize=11, color=WHITE,
+                ha="right", va="center", family="DejaVu Sans")
+        ax.text(p1_pct_x, y_pos, f"{int(pct)}", fontsize=10,
+                color=node_cmap(percentile_norm(pct)), ha="left", va="center",
+                family="DejaVu Sans")
 
-    # Cabeceras de columna
-    ax.text(6.7, y + 0.62, "CATE", fontsize=8.5, color="#c8c8c8", ha="right",
-            style="italic")
-    ax.text(7.85, y + 0.62, "pct", fontsize=8.5, color="#c8c8c8", ha="right",
-            style="italic")
+    # Footer
+    footer_y = y_metrics - len(metrics) * row_height
+    if len(metrics) % 2 == 1:
+        ax.add_patch(Rectangle((0.5, footer_y - 0.4), 8.0, 0.8,
+                               facecolor="white", alpha=0.05))
+    ax.text(0.7, footer_y, f"*{footer_text}", fontsize=10, color=WHITE,
+            ha="left", style="italic", fontweight="bold", va="center",
+            family="DejaVu Sans")
 
-    # Leyenda LOW -> HIGH
-    leg_y = y - len(metrics) * row_h - 0.2
-    for i, (lo, hi) in enumerate([(0, 20), (21, 40), (41, 60), (61, 80), (81, 100)]):
-        xp = 1.4 + i * 1.15
-        ax.plot([xp - 0.32, xp + 0.32], [leg_y, leg_y],
-                color=PCT_CMAP(norm(i * 25)), lw=4, solid_capstyle="round")
-        ax.text(xp, leg_y - 0.32, f"{lo}-{hi}", fontsize=8.5, color=WHITE,
-                ha="center")
-    ax.text(0.7, leg_y, "percentil", fontsize=9, color=WHITE, ha="left",
-            va="center", style="italic")
-    ax.text(4.25, leg_y - 0.78, "percentil vs los 234 jugadores del torneo",
-            fontsize=8.5, color="#c8c8c8", ha="center", style="italic")
+    # Leyenda: 5 tramos de percentil
+    legend_y = footer_y - 0.8
+    intervals = [(0, 20), (21, 40), (41, 60), (61, 80), (81, 100)]
+    spacing = 0.8
+    for i, (lo, hi) in enumerate(intervals):
+        x_pos = 1.0 + i * spacing
+        ax.plot([x_pos - 0.25, x_pos + 0.25], [legend_y, legend_y],
+                color=node_cmap(percentile_norm(i * 25)), linewidth=3,
+                solid_capstyle="round")
+        ax.text(x_pos, legend_y - 0.3, f"{lo}-{hi}", fontsize=9, color=WHITE,
+                ha="center", family="DejaVu Sans")
 
-    if logo:
-        add_logo(fig, width_frac=0.20)
+    # Flecha BAJO -> ALTO
+    arrow_y = legend_y - 0.8
+    ax.annotate("", xy=(4.0, arrow_y), xytext=(1.2, arrow_y),
+                arrowprops=dict(arrowstyle="->", color=WHITE, lw=1))
+    ax.text(1.1, arrow_y, "BAJO", fontsize=9, color=WHITE, ha="right",
+            va="center", family="DejaVu Sans")
+    ax.text(4.1, arrow_y, "ALTO", fontsize=9, color=WHITE, ha="left",
+            va="center", family="DejaVu Sans")
+
+    add_logo(fig, width_frac=0.22)
     if save_path:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,14 +196,13 @@ def _combine(radar_path: Path, table_path: Path, out_path: Path) -> None:
 
 def player_ficha(df: pl.DataFrame, player_id: int, save_path=None) -> Path:
     """Ficha PCJ completa: radar geometrico + tabla de percentiles."""
-    import tempfile
     tmp = Path(tempfile.gettempdir())
     radar_p, table_p = tmp / f"_pcj_r_{player_id}.png", tmp / f"_pcj_t_{player_id}.png"
 
-    # Sin titulo en el radar — la identidad va en la cabecera de la tabla.
+    # Radar sin titulo ni logo: la identidad va en la tabla.
     player_radar(df, player_id, PCJ_METRICS, PCJ_TITLES,
                  title="", subtitle="", logo=False, save_path=radar_p)
-    create_stats_table(df, player_id, logo=True, save_path=table_p)
+    create_stats_table(df, player_id, save_path=table_p)
 
     if save_path is None:
         save_path = _SRC.parent / "outputs" / "viz" / f"ficha_{player_id}.png"

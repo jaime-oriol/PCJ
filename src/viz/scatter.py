@@ -58,8 +58,8 @@ def diamond_scatter(df: pl.DataFrame,
     left_n = 0.99 * (left - lmin) / (lmax - lmin)
     right_n = 0.99 * (right - rmin) / (rmax - rmin)
 
-    lq = left_n.quantile([0.2, 0.8]).tolist()
-    rq = right_n.quantile([0.2, 0.8]).tolist()
+    l_med = float(left_n.median())     # mediana (percentil 50) Remontador
+    r_med = float(right_n.median())    # mediana (percentil 50) Cerrojo
 
     # Percentil 0-100 para seleccionar a los que mas destacan
     px, py = pdf[x_pct].to_numpy() * 100.0, pdf[y_pct].to_numpy() * 100.0
@@ -102,17 +102,14 @@ def diamond_scatter(df: pl.DataFrame,
     ax.axis["left"].label.set_rotation(0)
     ax.grid(alpha=0.18, color=WHITE)
 
-    # Region sombreada: el 60% central de jugadores (percentil 20-80)
-    aux.fill([rq[0], rq[0], rq[1], rq[1]], [0, 100, 100, 0],
-             color="grey", alpha=0.13, zorder=0)
-    aux.fill([0, rq[0], rq[0], 0], [lq[0], lq[0], lq[1], lq[1]],
-             color="grey", alpha=0.13, zorder=0)
-    aux.fill([rq[1], 100, 100, rq[1]], [lq[0], lq[0], lq[1], lq[1]],
-             color="grey", alpha=0.13, zorder=0)
-    aux.plot([0, 100], [0, 100], color=WHITE, lw=1.3, alpha=0.5,
-             ls="--", zorder=1)
     aux.scatter(right_n, left_n, c=left_n + right_n, cmap=PCT_CMAP,
                 edgecolor=WHITE, s=58, lw=0.5, zorder=2, alpha=0.8)
+    # Dos lineas: la mediana (percentil 50) de cada indice -> 4 cuadrantes.
+    # zorder alto = por encima de los puntos; span exacto del diamante [0, 1].
+    aux.plot([r_med, r_med], [0.0, 1.001], color=WHITE, lw=2.4, alpha=0.9,
+             ls=(0, (7, 4)), zorder=6, solid_capstyle="round")
+    aux.plot([0.0, 1.001], [l_med, l_med], color=WHITE, lw=2.4, alpha=0.9,
+             ls=(0, (7, 4)), zorder=6, solid_capstyle="round")
 
     # Los que mas destacan, etiquetados
     texts = []
@@ -150,8 +147,8 @@ def diamond_scatter(df: pl.DataFrame,
              fontweight="bold", style="italic")
 
     # Notas (en esquinas libres del lienzo, no sobre el diamante)
-    fig.text(0.045, 0.06, "Zona gris: el 60% de jugadores mas normalitos\n"
-             "(percentil 20-80 en cada indice).",
+    fig.text(0.045, 0.06, "Lineas discontinuas: la mediana (percentil 50)\n"
+             "de cada indice — parten el campo en 4 cuadrantes.",
              ha="left", va="bottom", color="#9a9c9b", fontsize=8.5,
              style="italic", linespacing=1.5)
     add_logo(fig, width_frac=0.15)
