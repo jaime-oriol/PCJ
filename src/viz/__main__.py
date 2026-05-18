@@ -1,8 +1,9 @@
-"""Runner unico: renderiza las 4 figuras core del PCJ a outputs/viz/.
+"""Runner unico: renderiza las figuras core del PCJ a outputs/viz/.
 
 Uso:
-    python -m src.viz                 # las 4 figuras
+    python -m src.viz                 # PPCF + scatter + event-study + ficha
     python -m src.viz radar "Messi"   # solo el radar de un jugador
+    python -m src.viz ficha "Messi"   # solo la ficha (radar + tabla)
 """
 
 from __future__ import annotations
@@ -16,14 +17,28 @@ _SRC = Path(__file__).resolve().parents[1]
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from viz import figures, ppcf, radar, scatter
+from viz import ficha, figures, ppcf, radar, scatter
 
 _OUT = _SRC.parent / "outputs" / "viz"
 _TABLE = _SRC.parent / "outputs" / "pcj_table.parquet"
 
 
+def _render_radar(df: pl.DataFrame, query: str) -> Path:
+    """Radar individual de un jugador (id o substring de nombre)."""
+    pid = radar._find(df, query)
+    r = df.filter(pl.col("pff_player_id") == pid).row(0, named=True)
+    out = _OUT / f"radar_{pid}.png"
+    radar.player_radar(
+        df, pid,
+        title=f"{r['player_name']}  ·  Perfil Clutch del Jugador",
+        subtitle=f"{r['team_name']}  ·  {r['position_group']}  ·  "
+                 f"{int(r['minutes_played'])} min  —  Mundial Qatar 2022",
+        save_path=out)
+    return out
+
+
 def make_all() -> None:
-    """Renderiza PPCF + scatter + event-study + radar (jugador de portada)."""
+    """Renderiza PPCF + scatter + event-study + ficha (jugador de portada)."""
     print("[viz] PPCF — gol de Messi (ARG-MEX)...")
     fnum = ppcf.frame_for_clock(3835, period=2, clock_s=3812 - 3)
     ppcf.plot_ppcf(
@@ -39,31 +54,19 @@ def make_all() -> None:
     print("[viz] Event-study causal (M12)...")
     figures.event_study(save_path=_OUT / "event_study.png")
 
-    print("[viz] Radar — jugador de portada (Messi)...")
+    print("[viz] Ficha — jugador de portada (Messi)...")
     df = pl.read_parquet(_TABLE)
-    pid = radar._find(df, "Messi")
-    r = df.filter(pl.col("pff_player_id") == pid).row(0, named=True)
-    radar.player_radar(
-        df, pid,
-        title=f"{r['player_name']}  ·  Perfil Clutch del Jugador",
-        subtitle=f"{r['team_name']}  ·  {r['position_group']}  ·  "
-                 f"{int(r['minutes_played'])} min  —  Mundial Qatar 2022",
-        save_path=_OUT / f"radar_{pid}.png")
+    ficha.player_ficha(df, ficha._find(df, "Messi"))
 
-    print(f"[viz] OK — 4 figuras en {_OUT}")
+    print(f"[viz] OK — figuras en {_OUT}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "radar":
+    if len(sys.argv) > 2 and sys.argv[1] in ("radar", "ficha"):
         df = pl.read_parquet(_TABLE)
-        pid = radar._find(df, sys.argv[2] if len(sys.argv) > 2 else "Messi")
-        r = df.filter(pl.col("pff_player_id") == pid).row(0, named=True)
-        radar.player_radar(
-            df, pid,
-            title=f"{r['player_name']}  ·  Perfil Clutch del Jugador",
-            subtitle=f"{r['team_name']}  ·  {r['position_group']}  ·  "
-                     f"{int(r['minutes_played'])} min  —  Mundial Qatar 2022",
-            save_path=_OUT / f"radar_{pid}.png")
-        print(f"OK -> {_OUT}/radar_{pid}.png")
+        if sys.argv[1] == "radar":
+            print(f"OK -> {_render_radar(df, sys.argv[2])}")
+        else:
+            print(f"OK -> {ficha.player_ficha(df, ficha._find(df, sys.argv[2]))}")
     else:
         make_all()

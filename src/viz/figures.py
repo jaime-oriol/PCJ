@@ -22,7 +22,7 @@ _SRC = Path(__file__).resolve().parents[1]
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from viz.common import ATT, BG, DEF, GRID, WHITE, add_logo, style_ax
+from viz.common import ATT, BG, DEF, WHITE, add_logo, style_ax
 
 _DID = _SRC.parent / "data" / "parquet" / "derived" / "did"
 

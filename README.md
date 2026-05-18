@@ -50,11 +50,19 @@ TFM/
 │   ├── Z03_xpress.py                              # exPress Lee 2025 P(recovery<5s|press)
 │   ├── Z04_vdep.py                                # VDEP strict Toda 2022 (recovery + attacked)
 │   ├── Z05_maejima.py                             # Maejima 2024 nearest defender frame level
-│   └── Z06_unxpass.py                             # un xPass Robberechts 2023 creative decision
+│   ├── Z06_unxpass.py                             # un xPass Robberechts 2023 creative decision
+│   └── viz/                                       # capa de visualizacion (identidad propia)
+│       ├── common.py                              # estilo, colores, draw_pitch, logo, helpers
+│       ├── ppcf.py                                # superficie Pitch Control (Z02 + tracking PFF)
+│       ├── radar.py                               # radar geometrico de las 8 dimensiones clutch
+│       ├── scatter.py                             # diamond scatter Remontador x Cerrojo
+│       ├── ficha.py                               # ficha jugador = radar + tabla percentil
+│       └── figures.py                             # event-study causal (M12)
 ├── notebooks/
 │   └── regen_all.ipynb                            # regen E2E completa M03-M15 + Z03-Z06 en orden DAG
 └── outputs/
     ├── pcj_table.parquet                          # tabla scout final (234 jug x 277 cols)
+    ├── viz/                                       # figuras PNG (PPCF, radar, ficha, scatter, event-study)
     └── pcj_aux/
         ├── top10_chasing_per_position.parquet     # 16 position_group granulares
         ├── top10_protecting_per_position.parquet
@@ -111,6 +119,21 @@ E2E ejecutado al 100%. Outputs versionados en repo. Caches regenerables via `not
 
 Datos raw originales (PFF tracking 5 GB, StatsBomb, Wyscout) y documentacion interna del proyecto estan fuera del repo (`.gitignore`).
 
+## Visualizaciones
+
+Paquete `src/viz/` con identidad visual propia (fondo oscuro, paleta, logo).
+Genera las figuras core del TFM a `outputs/viz/`:
+
+| Figura      | Comando                           | Que muestra                                          |
+|-------------|-----------------------------------|------------------------------------------------------|
+| PPCF        | `python -m src.viz.ppcf`          | Superficie Pitch Control en un shock (Spearman 2018) |
+| Radar       | `python -m src.viz radar "Messi"` | Radar de las 8 dimensiones clutch del jugador        |
+| Ficha       | `python -m src.viz ficha "Messi"` | Radar + tabla de percentiles vs su posicion          |
+| Scatter     | `python -m src.viz.scatter`       | Diamond Remontador x Cerrojo (234 jugadores)         |
+| Event-study | `python -m src.viz.figures`       | Efecto causal del shock minuto a minuto (M12)        |
+
+`python -m src.viz` renderiza todas de una.
+
 ## Reproducibilidad
 
 ```bash
@@ -134,4 +157,5 @@ modelos (catboost, lightgbm, numpyro/jax cuda12, scikit-learn>=1.6) +
 hyperparam tuning (optuna) + acciones (socceraction atomic VAEP) +
 DiD moderno (pyfixest fixed effects + Sun Abraham event study) +
 DoubleML cross fitted (doubleml IRM/PLR para AIPW Chernozhukov 2018) +
-CATE bayesiano jerarquico via NUTS HMC + LKJCholesky cross canal (numpyro).
+CATE bayesiano jerarquico via NUTS HMC + LKJCholesky cross canal (numpyro) +
+visualizacion (matplotlib, mplsoccer, adjustText, Pillow).

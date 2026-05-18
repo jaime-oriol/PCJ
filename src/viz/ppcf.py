@@ -24,7 +24,7 @@ if str(_SRC) not in sys.path:
 import Z02_pitch_control as pc
 from M01_loader_pff import scan_tracking, load_metadata, load_rosters
 
-from viz.common import (ATT, BALL, BG, DEF, GK, PE_S, PITCH_LENGTH,
+from viz.common import (ATT, BALL, DEF, GK, PE_S, PITCH_LENGTH,
                         PITCH_WIDTH, PPCF_CMAP, WHITE, make_pitch, save_fig)
 
 # Lag (frames) para derivar velocidades por diferencias finitas (~0.5 s).
