@@ -46,7 +46,7 @@ def player_radar(df: pl.DataFrame, player_id: int,
                  metric_titles: list[str] = PCJ_TITLES,
                  colors: tuple[str, str] = (ATT, DEF),
                  title: str = "", subtitle: str = "",
-                 save_path=None):
+                 logo: bool = True, save_path=None):
     """Radar geometrico de 1 jugador (anillos de color alternos).
 
     Portado de footballdecoded/viz/swarm_radar._create_traditional_radar.
@@ -156,7 +156,8 @@ def player_radar(df: pl.DataFrame, player_id: int,
     if subtitle:
         fig.text(0.5, 0.93, subtitle, ha="center", va="top", color="#c8c8c8",
                  fontsize=11)
-    add_logo(fig, width_frac=0.13)
+    if logo:
+        add_logo(fig, width_frac=0.13)
 
     if save_path:
         save_path = Path(save_path)

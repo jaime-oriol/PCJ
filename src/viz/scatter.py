@@ -1,12 +1,11 @@
-"""scatter - Scatter Remontador x Cerrojo de los jugadores del PCJ.
+"""scatter - Diamond scatter Remontador x Cerrojo del PCJ.
 
-Estilo portado de jaime-oriol/footballdecoded (viz/scatter.py): puntos
-coloreados por percentil combinado (node_cmap), top-10 etiquetados con bbox,
-region sombreada P20-P80, lineas de referencia.
+Portado de jaime-oriol/footballdecoded (viz/scatter.py, create_diamond_scatter):
+ejes rotados 45 grados (floating_axes), puntos coloreados por percentil
+combinado, top-10 etiquetado con adjustText, region sombreada P20-P80.
 
-Adaptacion: los indices PCJ son CATEs con signo (centrados en 0), no stats
-per-90 positivas — se usan ejes de cuadrante (0,0 al centro) en vez del
-diamante rotado 45 grados, que asume metricas positivas.
+Adaptacion minima: los indices PCJ son CATEs con signo, asi que la
+normalizacion es min-max `(v-min)/(max-min)` en vez de `v/max`.
 
 Uso:
     python -m src.viz.scatter
@@ -20,12 +19,15 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
+import mpl_toolkits.axisartist.floating_axes as floating_axes
+from matplotlib.transforms import Affine2D
+from mpl_toolkits.axisartist.grid_finder import DictFormatter, FixedLocator
 
 _SRC = Path(__file__).resolve().parents[1]
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from viz.common import BG, GRID, PCT_CMAP, PE, WHITE, add_logo, style_ax
+from viz.common import BG, PCT_CMAP, WHITE, add_logo
 
 _TABLE = _SRC.parent / "outputs" / "pcj_table.parquet"
 
@@ -35,87 +37,129 @@ try:
 except ImportError:
     _HAS_ADJUST = False
 
-
-def _short(name: str) -> str:
-    """'Lionel Messi' -> 'L. Messi'."""
-    parts = name.split()
-    return f"{parts[0][0]}. {parts[-1]}" if len(parts) > 1 else name
+# 6 marcas por eje (no 11) — el diamante rotado se satura con mas.
+_TICKS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
 
 def diamond_scatter(df: pl.DataFrame,
                     x_metric: str = "chasing_clutch_idx",
                     y_metric: str = "protecting_clutch_idx",
-                    x_label: str = "Indice Remontador  (empuje + off-ball | post-GA)",
-                    y_label: str = "Indice Cerrojo  (defensa + fisico | post-GF)",
-                    title: str = "Perfil Clutch del Jugador  —  Remontador x Cerrojo",
-                    subtitle: str = "Mundial Qatar 2022  ·  CATE bayesiano por jugador "
-                                    "(eta individual, neto de equipo y posicion)",
+                    x_pct: str = "pct_chasing_global",
+                    y_pct: str = "pct_protecting_global",
                     save_path=None):
-    """Scatter de cuadrantes x_metric x y_metric con top-10 etiquetado."""
+    """Diamond scatter (ejes rotados 45 grados) Remontador x Cerrojo."""
     pdf = df.to_pandas()
-    x = pdf[x_metric].to_numpy(dtype=float)
-    y = pdf[y_metric].to_numpy(dtype=float)
+    left = pdf[x_metric].fillna(0.0)      # eje izquierdo  (Remontador)
+    right = pdf[y_metric].fillna(0.0)     # eje inferior   (Cerrojo)
 
-    # Color por percentil combinado (idem node_cmap de footballdecoded)
-    rx = pdf[x_metric].rank(pct=True).to_numpy()
-    ry = pdf[y_metric].rank(pct=True).to_numpy()
-    cval = (rx + ry) / 2
+    # Normalizacion min-max -> [0, 0.99]  (CATEs con signo)
+    lmin, lmax = float(left.min()), float(left.max())
+    rmin, rmax = float(right.min()), float(right.max())
+    left_n = 0.99 * (left - lmin) / (lmax - lmin)
+    right_n = 0.99 * (right - rmin) / (rmax - rmin)
 
-    fig, ax = plt.subplots(figsize=(9.5, 9.5))
-    fig.set_facecolor(BG)
-    style_ax(ax, ygrid=False)
-    ax.grid(True, color=GRID, linewidth=0.7, alpha=0.7)
-    ax.set_axisbelow(True)
+    lq = left_n.quantile([0.2, 0.8]).tolist()
+    rq = right_n.quantile([0.2, 0.8]).tolist()
 
-    # Region sombreada P20-P80 en cualquiera de los dos ejes
-    qx = np.quantile(x, [0.2, 0.8])
-    qy = np.quantile(y, [0.2, 0.8])
-    ax.axvspan(qx[0], qx[1], color="grey", alpha=0.10, zorder=0)
-    ax.axhspan(qy[0], qy[1], color="grey", alpha=0.10, zorder=0)
+    # Percentil 0-100 para seleccionar a los que mas destacan
+    px, py = pdf[x_pct].to_numpy() * 100.0, pdf[y_pct].to_numpy() * 100.0
+    pdf = pdf.assign(_px=px, _py=py)
+    top = pdf[(pdf["_px"] >= 81) & (pdf["_py"] >= 81)]
+    if len(top) < 5:
+        top = pdf[(pdf["_px"] >= 75) & (pdf["_py"] >= 75)]
+    top = top.assign(_tot=top["_px"] + top["_py"]).nlargest(10, "_tot")
 
-    # Ejes de cuadrante en 0
-    ax.axvline(0, color="#7a7c7b", lw=1.0, ls=(0, (3, 3)), zorder=1)
-    ax.axhline(0, color="#7a7c7b", lw=1.0, ls=(0, (3, 3)), zorder=1)
+    fig = plt.figure(figsize=(9.5, 10), facecolor=BG)
 
-    ax.scatter(x, y, c=cval, cmap=PCT_CMAP, edgecolor=WHITE, s=70, lw=0.5,
-               alpha=0.85, zorder=3)
+    # Marcas de eje: valor real (con signo) en 6 posiciones
+    left_dict = {i: f"{lmin + (i / 0.99) * (lmax - lmin):+.3f}" for i in _TICKS}
+    right_dict = {i: f"{rmin + (i / 0.99) * (rmax - rmin):+.3f}" for i in _TICKS}
 
-    # Top-10 por suma de percentiles -> etiquetado
-    top_idx = np.argsort(-(rx + ry))[:10]
+    transform = Affine2D().rotate_deg(45)
+    helper = floating_axes.GridHelperCurveLinear(
+        transform, (0, 1.001, 0, 1.001),
+        grid_locator1=FixedLocator(_TICKS), grid_locator2=FixedLocator(_TICKS),
+        tick_formatter1=DictFormatter(right_dict),
+        tick_formatter2=DictFormatter(left_dict))
+    ax = floating_axes.FloatingSubplot(fig, 111, grid_helper=helper)
+    ax.set_position([0.10, 0.10, 0.80, 0.70], which="both")
+    aux = ax.get_aux_axes(transform)
+    ax = fig.add_axes(ax)
+    aux.patch = ax.patch
+
+    ax.axis["left"].line.set_color(WHITE)
+    ax.axis["bottom"].line.set_color(WHITE)
+    ax.axis["right"].set_visible(False)
+    ax.axis["top"].set_visible(False)
+    ax.axis["left"].major_ticklabels.set(rotation=0, ha="center", fontsize=8.5)
+    ax.axis["bottom"].major_ticklabels.set(fontsize=8.5)
+    ax.axis["bottom"].major_ticklabels.set_pad(6)
+    for side, lbl in (("left",   "REMONTADOR  —  reaccion tras encajar un gol"),
+                      ("bottom", "CERROJO  —  aguante tras marcar un gol")):
+        ax.axis[side].set_label(lbl)
+        ax.axis[side].label.set(color=WHITE, fontweight="bold", fontsize=11)
+        ax.axis[side].LABELPAD += 9
+    ax.axis["left"].label.set_rotation(0)
+    ax.grid(alpha=0.18, color=WHITE)
+
+    # Region sombreada: el 60% central de jugadores (percentil 20-80)
+    aux.fill([rq[0], rq[0], rq[1], rq[1]], [0, 100, 100, 0],
+             color="grey", alpha=0.13, zorder=0)
+    aux.fill([0, rq[0], rq[0], 0], [lq[0], lq[0], lq[1], lq[1]],
+             color="grey", alpha=0.13, zorder=0)
+    aux.fill([rq[1], 100, 100, rq[1]], [lq[0], lq[0], lq[1], lq[1]],
+             color="grey", alpha=0.13, zorder=0)
+    aux.plot([0, 100], [0, 100], color=WHITE, lw=1.3, alpha=0.5,
+             ls="--", zorder=1)
+    aux.scatter(right_n, left_n, c=left_n + right_n, cmap=PCT_CMAP,
+                edgecolor=WHITE, s=58, lw=0.5, zorder=2, alpha=0.8)
+
+    # Los que mas destacan, etiquetados
     texts = []
-    for i in top_idx:
-        name = _short(str(pdf.iloc[i].get("player_name", pdf.index[i])))
-        t = ax.annotate(name, (x[i], y[i]), color="yellow", fontsize=8.5,
-                        fontweight="bold", ha="center", va="center",
-                        bbox=dict(boxstyle="round,pad=0.2", facecolor=BG,
-                                  edgecolor="yellow", alpha=0.95, linewidth=1),
-                        zorder=6)
-        texts.append(t)
+    for i, p in top.iterrows():
+        parts = str(p.get("player_name", i)).split()
+        short = f"{parts[0][0]}. {parts[-1]}" if len(parts) > 1 else parts[0]
+        texts.append(aux.annotate(
+            short, xy=(right_n.loc[i], left_n.loc[i]), color="yellow",
+            fontsize=8.5, fontweight="bold", ha="center", va="center", zorder=4,
+            bbox=dict(boxstyle="round,pad=0.22", facecolor=BG, edgecolor="yellow",
+                      alpha=0.95, linewidth=1)))
     if _HAS_ADJUST and texts:
-        adjustText.adjust_text(texts, ax=ax, force_text=1.4,
-                               expand_text=(1.8, 1.8),
+        adjustText.adjust_text(texts, ax=aux, force_text=1.6,
+                               expand_text=(2.1, 2.1),
                                arrowprops=dict(arrowstyle="-", color="yellow",
-                                               alpha=0.8, lw=1.0))
+                                               alpha=0.9, linewidth=1.2))
 
-    # Etiqueta del cuadrante "dual clutch"
-    ax.text(0.985, 0.985, "DUAL CLUTCH", transform=ax.transAxes, ha="right",
-            va="top", color="#c8c8c8", fontsize=10, fontweight="bold",
-            style="italic", path_effects=PE)
+    # Titulo + subtitulo (lenguaje simple)
+    fig.text(0.5, 0.965, "Quien tira del equipo y quien lo sostiene",
+             ha="center", va="top", color=WHITE, fontsize=18, fontweight="bold")
+    fig.text(0.5, 0.93,
+             "Mundial Qatar 2022  ·  como cambia cada jugador tras un gol, "
+             "aislando lo que aporta el resto del equipo",
+             ha="center", va="top", color="#c8c8c8", fontsize=10.5)
 
-    ax.set_xlabel(x_label, fontsize=11, fontweight="bold")
-    ax.set_ylabel(y_label, fontsize=11, fontweight="bold")
-    fig.text(0.5, 0.975, title, ha="center", va="top", color=WHITE,
-             fontsize=15, fontweight="bold")
-    fig.text(0.5, 0.945, subtitle, ha="center", va="top", color="#c8c8c8",
-             fontsize=9.5)
-    fig.text(0.5, 0.022, "Region sombreada: percentil 20-80 en cada eje.",
-             ha="center", color="#c8c8c8", fontsize=9, style="italic")
-    add_logo(fig, width_frac=0.12)
+    # Carteles laterales en lenguaje futbolero
+    fig.text(0.205, 0.70, "Por este lado\nLOS QUE TIRAN DEL EQUIPO\ncuando toca remontar",
+             ha="center", va="center", color="#e8e8e8", fontsize=10,
+             linespacing=1.5)
+    fig.text(0.795, 0.70, "Por este lado\nLOS QUE AGUANTAN EL RESULTADO\ncuando hay que cerrar",
+             ha="center", va="center", color="#e8e8e8", fontsize=10,
+             linespacing=1.5)
+    fig.text(0.5, 0.795, "ARRIBA: los que hacen LAS DOS COSAS",
+             ha="center", va="center", color="yellow", fontsize=10,
+             fontweight="bold", style="italic")
+
+    # Notas (en esquinas libres del lienzo, no sobre el diamante)
+    fig.text(0.045, 0.06, "Zona gris: el 60% de jugadores mas normalitos\n"
+             "(percentil 20-80 en cada indice).",
+             ha="left", va="bottom", color="#9a9c9b", fontsize=8.5,
+             style="italic", linespacing=1.5)
+    add_logo(fig, width_frac=0.15)
 
     if save_path:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor=BG)
+        fig.savefig(save_path, dpi=300, facecolor=BG, bbox_inches="tight")
         plt.close(fig)
     return fig
 
